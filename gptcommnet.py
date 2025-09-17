@@ -8,7 +8,9 @@ import docx
 import streamlit as st # st.secrets
 
 # --- .env 파일에서 API 키 로드 ---
-load_dotenv()
+if "OPENAI_API_KEY" not in st.secrets:
+    st.error("먼저 앱의 Settings > Secrets 메뉴에 OpenAI API 키를 설정해주세요.")
+    st.stop() # 키가 없으면 여기서 앱 실행을 멈춤
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 #==============================================================================
@@ -231,3 +233,4 @@ if uploaded_file:
                 except Exception as e:
 
                     st.error(f"OpenAI API 호출 중 오류가 발생했습니다: {e}")
+
