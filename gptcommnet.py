@@ -201,7 +201,7 @@ if uploaded_file:
 - 항목 간 반복 표현은 피하고, 문장은 간결하게
 """
             USER_MSG = f"""
-아래 '이슈 원문'과 '스펙 군집 통계'를 참고하여, 위 [출력 형식]에 맞춘 상세한 QA 리포트를 작성하라.
+JSON 형식의 '이슈 데이터'를 [분석 규칙]과 [출력 스캐폴드]에 따라 분석하여 상세한 QA 리포트를 작성하라.
 - 스펙 공통분모(RAM/Rank/Chipset/GPU)를 활용해 이슈를 군집화하고, 동일 유형은 하나의 항목으로 통합하라.
 - 현상/영향/원인 추정/권고를 모두 포함하라.
 
@@ -230,4 +230,5 @@ if uploaded_file:
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                     )
                 except Exception as e:
+
                     st.error(f"OpenAI API 호출 중 오류가 발생했습니다: {e}")
