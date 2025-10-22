@@ -8,12 +8,11 @@ import openpyxl
 import io
 import docx
 
-# --- .env 파일에서 API 키 로드 ---
 load_dotenv()
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 #==============================================================================
-# 1. 메모 추출 및 데이터 처리 함수들 (변경 없음)
+# 1. 메모 추출 및 데이터 처리 함수들 - GPU, 제조사 추가
 #==============================================================================
 def find_row_by_labels(ws, labels, search_rows=30, search_cols=50):
     for r in range(1, search_rows + 1):
@@ -34,21 +33,51 @@ def get_checklist_label(ws, row):
     return " / ".join(label_parts)
 
 def extract_comments_as_dataframe(wb, target_sheet_names):
+    """메모 + 스펙 정보를 한 번에 추출 (GPU, 제조사 포함)"""
     extracted_data = []
     for sheet_name in target_sheet_names:
         if sheet_name not in wb.sheetnames:
             st.warning(f"'{sheet_name}' 시트를 찾을 수 없습니다."); continue
         ws = wb[sheet_name]
-        header_rows = {'Model': find_row_by_labels(ws, ['Model', '제품명']), 'Chipset': find_row_by_labels(ws, ['Chipset', 'CPU', 'AP']), 'RAM': find_row_by_labels(ws, ['RAM', '메모리']), 'Rank': find_row_by_labels(ws, ['Rating Grade?', 'Rank', '등급']), 'OS': find_row_by_labels(ws, ['OS Version', 'Android', 'iOS', 'OS'])}
+        
+        # <<<< [핵심 수정] GPU, 제조사 행도 추가로 찾기
+        header_rows = {
+            'Model': find_row_by_labels(ws, ['Model', '제품명']),
+            'Chipset': find_row_by_labels(ws, ['Chipset', 'CPU', 'AP', 'SoC']),
+            'RAM': find_row_by_labels(ws, ['RAM', '메모리']),
+            'Rank': find_row_by_labels(ws, ['Rating Grade?', 'Rank', '등급']),
+            'OS': find_row_by_labels(ws, ['OS Version', 'Android', 'iOS', 'OS']),
+            'GPU': find_row_by_labels(ws, ['GPU', 'Graphic', 'Graphics']),  # GPU 행 찾기
+            'Manufacturer': find_row_by_labels(ws, ['제조사', 'Manufacturer', 'Maker', 'Brand'])  # 제조사 행 찾기
+        }
+        
         if header_rows['Model'] == 0: continue
+        
         for row in ws.iter_rows():
             for cell in row:
                 if cell.comment and str(cell.value).strip().lower() == 'fail':
                     r, c = cell.row, cell.column
-                    device_info = {key: ws.cell(row=num, column=c).value if num > 0 else "" for key, num in header_rows.items()}
+                    
+                    # 각 헤더 행에서 해당 열의 값 추출
+                    device_info = {key: ws.cell(row=num, column=c).value if num > 0 else "" 
+                                   for key, num in header_rows.items()}
+                    
                     checklist = get_checklist_label(ws, r)
                     cleaned_comment = cell.comment.text.split("https://go.microsoft.com/fwlink/?linkid=870924.", 1)[-1].strip()
-                    extracted_data.append({"Sheet": ws.title, "Device(Model)": device_info.get('Model', ''), "Chipset": device_info.get('Chipset', ''), "RAM": device_info.get('RAM', ''), "Rank": device_info.get('Rank', ''), "OS": device_info.get('OS', ''), "Checklist": checklist, "Comment(Text)": cleaned_comment})
+                    
+                    extracted_data.append({
+                        "Sheet": ws.title,
+                        "Device(Model)": device_info.get('Model', ''),
+                        "Chipset": device_info.get('Chipset', ''),
+                        "RAM": device_info.get('RAM', ''),
+                        "Rank": device_info.get('Rank', ''),
+                        "OS": device_info.get('OS', ''),
+                        "GPU": device_info.get('GPU', ''),  # <<<< 추가
+                        "제조사": device_info.get('Manufacturer', ''),  # <<<< 추가
+                        "Checklist": checklist,
+                        "Comment(Text)": cleaned_comment
+                    })
+                    
     if not extracted_data: return None
     return pd.DataFrame(extracted_data)
 
@@ -68,61 +97,29 @@ if uploaded_file:
     st.info("파일에 포함된 시트 목록: " + ", ".join(sheet_names))
 
     st.markdown("---")
-    st.subheader("1. 분석할 시트를 선택하세요")
+    st.subheader("1. 분석할 테스트 시트를 선택하세요")
     test_sheets_selected = st.multiselect(
-        '메모를 추출할 테스트 시트를 모두 선택하세요',
+        '메모를 추출할 테스트 시트를 모두 선택하세요 (예: Compatibility Test(AOS), Compatibility Test(iOS))',
         options=sheet_names
     )
-    # <<< [수정됨] 상세 스펙 시트를 여러 개 선택할 수 있도록 변경 (selectbox -> multiselect)
-    spec_sheets_selected = st.multiselect(
-        'GPU 등 상세 정보가 포함된 스펙 시트를 모두 선택하세요 (AOS, IOS 등)',
-        options=sheet_names
-    )
+    
     st.markdown("---")
     
     if st.button("분석 및 코멘트 생성 시작", type="primary"):
         wb = openpyxl.load_workbook(uploaded_file, data_only=True)
-        df_issue = extract_comments_as_dataframe(wb, test_sheets_selected)
+        
+        # <<<< [변경] 이제 extract 함수가 GPU, 제조사까지 한 번에 추출
+        df_final = extract_comments_as_dataframe(wb, test_sheets_selected)
 
-        if df_issue is not None:
-            df_final = df_issue
-            # <<< [수정됨] 여러 스펙 시트를 하나로 합치는 로직 추가
-            if spec_sheets_selected:
-                st.info(f"선택된 스펙 시트 {spec_sheets_selected}의 추가 정보를 병합합니다.")
-                
-                all_spec_dfs = []
-                for sheet_name in spec_sheets_selected:
-                    df_temp_spec = pd.read_excel(xls, sheet_name=sheet_name)
-                    all_spec_dfs.append(df_temp_spec)
-                
-                # 모든 스펙 데이터프레임을 하나로 합침
-                df_spec = pd.concat(all_spec_dfs, ignore_index=True)
-                
-                df_issue['model_norm'] = df_issue['Device(Model)'].apply(normalize_model_name)
-                
-                model_col_name = next((col for col in ['Model', '모델명', '제품명'] if col in df_spec.columns), None)
-                if not model_col_name:
-                     st.error("스펙 시트에 'Model' 또는 '모델명'/'제품명' 열이 없습니다."); st.stop()
-                df_spec['model_norm'] = df_spec[model_col_name].apply(normalize_model_name)
-                
-                spec_cols_to_merge = ['model_norm']
-                for col in ['GPU', '제조사']:
-                    if col in df_spec.columns:
-                        spec_cols_to_merge.append(col)
-                
-                # 중복된 모델명이 있을 경우를 대비해 중복 제거 (첫 번째 값 유지)
-                df_spec = df_spec.drop_duplicates(subset=['model_norm'], keep='first')
-                
-                df_final = pd.merge(df_issue, df_spec[spec_cols_to_merge], on='model_norm', how='left')
-
+        if df_final is not None:
             st.success(f"{len(df_final)}개의 'Fail' 항목 분석 준비 완료.")
             st.dataframe(df_final.head())
             
-            # (이하 프롬프트 생성 및 GPT 호출 로직은 기존과 동일)
-            issue_blocks, stats_text = [], []
+            # GPT 프롬프트 생성 (GPU, 제조사 정보 포함)
+            issue_blocks = []
             for _, row in df_final.iterrows():
-                gpu_info = f" / GPU:{row.get('GPU','-')}" if 'GPU' in df_final.columns else ""
-                manu_info = f" / 제조사:{row.get('제조사','-')}" if '제조사' in df_final.columns else ""
+                gpu_info = f" / GPU:{row.get('GPU','-')}" if row.get('GPU') else ""
+                manu_info = f" / 제조사:{row.get('제조사','-')}" if row.get('제조사') else ""
                 issue_blocks.append(
                     f"- 기기: {row['Device(Model)']} / Chipset:{row.get('Chipset','-')} / RAM:{row.get('RAM','-')} / Rank:{row.get('Rank','-')}{gpu_info}{manu_info}\n"
                     f"  테스트 항목: {row['Checklist']}\n"
@@ -164,20 +161,20 @@ if uploaded_file:
      - 고사양: Snapdragon 8 Gen, Dimensity 9000 계열, Adreno 7xx 최신, Mali-G78/G710 이상  
      - 중사양: Snapdragon 6xx/7xx, Dimensity 700~800, Adreno 6xx 다수, Mali-G57/G68 등  
      - 저사양: RAM 2~4GB, Adreno 5xx, Mali-G52/G51, PowerVR GE 계열, Unisoc/Tiger 하위  
-   - 정확히 구분 어려우면 “보급형/중급형 추정”으로 표기한다.  
+   - 정확히 구분 어려우면 "보급형/중급형 추정"으로 표기한다.  
 5. **표현 범주**: issue_comment를 FailCommentExport 유형에 맞춰 표현한다.  
-   - “크래시/강제 종료/앱 종료/ANR”  
-   - “FPS/프레임/발열/스로틀링/로딩 지연”  
-   - “펀치홀/레터박스/노치/가림/겹침/깜빡임”  
-   - “로그인/네트워크/접속 불가”  
-   - “그래픽/텍스처/픽셀/비정상 출력”  
-   - “입력/터치 미동작”  
+   - "크래시/강제 종료/앱 종료/ANR"  
+   - "FPS/프레임/발열/스로틀링/로딩 지연"  
+   - "펀치홀/레터박스/노치/가림/겹침/깜빡임"  
+   - "로그인/네트워크/접속 불가"  
+   - "그래픽/텍스처/픽셀/비정상 출력"  
+   - "입력/터치 미동작"  
 6. **현상 → 영향 → 원인 추정 → 권고** 순으로 작성한다.  
 7. **수치 표기**: 기기 수가 명확히 입력에 있을 때만 "N대 중 M대" 형태로 표기한다. 없으면 "다수/일부 기기"로 표기한다.  
 8. **문체 규칙**:  
-   - “확인되었으며”, “재현됨”, “분석됩니다” 등 보고서 톤 사용.  
+   - "확인되었으며", "재현됨", "분석됩니다" 등 보고서 톤 사용.  
    - 중복 문장 피하고 간결하게 작성.  
-   - 불확실한 부분은 “추정/가능성/추가 확인 필요”로 기술한다.  
+   - 불확실한 부분은 "추정/가능성/추가 확인 필요"로 기술한다.  
 
 [출력 스캐폴드]
 ■ 주요 이슈 분석
@@ -230,5 +227,6 @@ JSON 형식의 '이슈 데이터'를 [분석 규칙]과 [출력 스캐폴드]에
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                     )
                 except Exception as e:
-
                     st.error(f"OpenAI API 호출 중 오류가 발생했습니다: {e}")
+        else:
+            st.warning("추출된 Fail 항목이 없습니다. 파일과 시트 선택을 확인하세요.")
