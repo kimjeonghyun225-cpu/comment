@@ -4,3 +4,5 @@ python-dotenv
 pandas
 openpyxl
 python-docx
+xlsxwriter
+tiktoken
