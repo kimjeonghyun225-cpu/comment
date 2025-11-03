@@ -188,15 +188,38 @@ JSON_SCHEMA_DOC = r"""
 """
 
 def build_system_prompt() -> str:
+    fewshot = """
+[예시-요약 스타일]
+summary: "입력 지연·회전 레이아웃 이슈 다수. 고사양군 정상, 펀치홀/노치군 보완 필요."
+
+[예시-issues 항목 1]
+title: "회전 시 레이아웃 깨짐(펀치홀 계열)"
+symptom: "세로→가로 전환 직후 탭바 겹침 및 터치 블록"
+reproduction: "펀치홀 기기에서 홈→설정→가로 회전→탭 전환"
+evidence: ["Galaxy S23 / Android14 주석", "로그 스크린샷 #12"]
+impact: "탐색 불가 구간 발생"
+priority: "P1"
+cause: "cutout insets 미고려"
+recommendation: "WindowInsets 적용 및 cutout 대응 규칙 추가"
+
+[예시-issues 항목 2]
+title: "입력 지연(중저가 GPU)"
+symptom: "리스트 스크롤·터치 반응 지연"
+reproduction: "저가 PowerVR 계열에서 리스트 스크롤 반복"
+evidence: ["Redmi Note9, PowerVR GE8320", "프레임 드랍 로그"]
+impact: "UX 저하"
+priority: "P1"
+cause: "과도한 overdraw / 미세 최적화 부재"
+recommendation: "DiffUtil/RecyclerView 최적화 및 overdraw 감축"
+"""
     return (
         "당신은 모바일 앱/게임 QA 리드입니다. 데이터 기반, 간결한 한국어로 작성하세요.\n"
         "입력(메트릭/변동/근거/표본) 내 사실만 사용하고 추측·과장은 금지합니다.\n"
-        "조사형 표현(확인/분석/추정됩니다)을 사용하고, 중복·장황 서술을 지양합니다.\n"
-        "데이터 기반: 제공된 증거만 사용, 추측 금지\n"
-        "metrics.log_hypotheses 가 존재하면, 각 이슈의 'cause'와 근거(evidence)에 우선 반영하십시오.\n"
-        "출력은 반드시 JSON이며, 다음 스키마를 따르세요.\n"
-        "요약(summary)과 이슈 제목/본문에는 프로젝트명이나 체크리스트 버전을 포함하지 마십시오.\n"
+        "조사형 표현(확인/분석/추정) 위주, 중복·장황 서술 지양.\n"
+        "metrics.log_hypotheses가 있으면 이슈의 cause/evidence에 우선 반영.\n"
+        "출력은 반드시 JSON이며 아래 스키마를 엄격 준수. (키 추가 금지)\n"
         + JSON_SCHEMA_DOC
+        + "\n[형식 예시]\n" + fewshot.strip()
     )
 
 def build_user_prompt(
@@ -235,7 +258,8 @@ def build_user_prompt(
         "변동: {이전 릴리스 대비 변화}\n"
         "근거: {대표 실패 로그/링크}\n\n"
         + guideline + "\n\n=== 데이터(JSON) ===\n"
-        + json.dumps(payload, ensure_ascii=False)
+        # 공백 제거로 토큰 절감
+        + json.dumps(payload, ensure_ascii=False, separators=(",",":"))
     )
 
 def parse_llm_json(text: str) -> Dict[str, Any]:
@@ -257,9 +281,6 @@ def parse_llm_json(text: str) -> Dict[str, Any]:
 
 # ------------------------------
 # Summary 상세 블록 빌더
-#   - 일반 이슈(제목 없이 5줄)
-#   - GPU/CPU 군집(있을 때)
-#   - Feature(펀치홀/노치/회전/설치/권한/입력지연 등) 군집
 # ------------------------------
 _DEVICE_PAT = re.compile(r"(Galaxy\s?[A-Z0-9\-]+|SM\-[A-Z0-9]+|iPhone\s?[A-Z0-9\-+ ]+|Pixel\s?\d+(?:\sPro)?|Redmi\s?[A-Z0-9\-]+|Xiaomi\s?[A-Z0-9\-]+|OPPO\s?[A-Z0-9\-]+|VIVO\s?[A-Z0-9\-]+)", re.I)
 
@@ -311,7 +332,7 @@ def build_summary_block(
         lines.append(block.strip())
         lines.append("---")
 
-    # [B] Feature 군집 (비GPU/CPU: punch_hole, notch, rotation 등)
+    # [B] Feature 군집
     if isinstance(metrics, dict):
         fcd = metrics.get("clusters_feature_detailed") or []
         for c in fcd:
@@ -392,7 +413,7 @@ def write_excel_report(result: Dict[str, Any], df_final: pd.DataFrame, path: str
         }]
         pd.DataFrame(exec_rows).to_excel(wr, sheet_name="Executive_Summary", index=False)
 
-        # 1) Summary — 상세 블록(일반 이슈 + Feature 군집)
+        # 1) Summary — 상세 블록
         summary_text = build_summary_block(
             result.get("issues", []),
             topn=100,
@@ -427,7 +448,7 @@ def write_excel_report(result: Dict[str, Any], df_final: pd.DataFrame, path: str
         else:
             pd.DataFrame().to_excel(wr, sheet_name="Evidence_Sample", index=False)
 
-        # 5) Cluster_*: by_issue_tag / clusters_feature_detailed 등
+        # 5) Cluster_* 시트
         metrics_in_result = result.get("metrics", {}) if isinstance(result, dict) else {}
         clusters = metrics_in_result.get("clusters", {})
         if isinstance(clusters, dict) and clusters:
