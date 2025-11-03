@@ -107,9 +107,34 @@ if not st.button("분석 및 리포트 생성", type="primary"):
 log_hypotheses, clusters, evidence_links = [], {}, []
 
 # 3) Fail + 코멘트 추출 (라벨행→Fail열 세로추출, 병합셀 보정)
+# 3) Fail + 코멘트 추출 (라벨행→Fail열 세로추출, 병합셀 보정)
 with step_status("Fail + 셀 코멘트 추출"):
-    wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
-    df_issue = extract_comments_as_dataframe(wb, test_sheets_selected)
+    try:
+        # data_only=False로 변경 (코멘트 읽기 위해)
+        wb = openpyxl.load_workbook(io.BytesIO(data), data_only=False)
+        
+        # 선택된 시트가 워크북에 있는지 확인
+        available_sheets = wb.sheetnames
+        valid_sheets = [s for s in test_sheets_selected if s in available_sheets]
+        
+        if not valid_sheets:
+            st.error(f"선택한 시트를 찾을 수 없습니다. 사용 가능한 시트: {available_sheets}")
+            st.stop()
+        
+        df_issue = extract_comments_as_dataframe(wb, valid_sheets)
+        diag_dump("추출 샘플", df_issue.head(12))
+        
+        if df_issue.empty:
+            st.warning("❌ Fail+코멘트 항목이 없습니다(셀 코멘트 기준).")
+            st.info("💡 팁: Excel에서 Fail 셀에 마우스 우클릭 → '메모 삽입'으로 코멘트를 추가했는지 확인하세요.")
+            st.stop()
+            
+    except Exception as e:
+        st.error(f"코멘트 추출 중 오류: {str(e)}")
+        st.write("선택된 시트:", test_sheets_selected)
+        if 'wb' in locals():
+            st.write("워크북의 실제 시트:", wb.sheetnames)
+        st.stop()
     diag_dump("추출 샘플", df_issue.head(12))
     if df_issue.empty:
         st.warning("❌ Fail+코멘트 항목이 없습니다(셀 코멘트 기준).")
@@ -406,5 +431,6 @@ try:
         st.download_button("📊 Excel 리포트 다운로드", f.read(), file_name=output)
 except Exception as e:
     st.error(f"리포트 생성 오류: {e}")
+
 
 
