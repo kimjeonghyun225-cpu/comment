@@ -390,7 +390,7 @@ if uploaded_file:
                 return sum(len(enc.encode(m.get("content",""))) for m in msgs)
             except Exception:
                 return sum(_rough_token_count(m.get("content","")) for m in msgs)
-        def fit_prompt(build_user, base_kwargs, model_budget=120000, reserve_output=6000):
+        def fit_prompt(build_user, base_kwargs, model_budget=30000, reserve_output=6000):
             max_rows_list = [800, 600, 400, 300, 200, 100]
             df = base_kwargs["sample_issues"]
             for mr in max_rows_list:
@@ -417,21 +417,51 @@ if uploaded_file:
             diag_dump("토큰 진단", diag_budget)
 
         # 10) OpenAI 호출
-        with st.spinner("GPT가 리포트를 작성 중입니다..."):
-            try:
-                resp = client.chat.completions.create(
-                    model="gpt-4o",
-                    temperature=0.1,
-                    top_p=0.9,
-                    messages=[{"role":"system","content":sp},{"role":"user","content":up}],
-                )
-                raw = resp.choices[0].message.content
-                result = parse_llm_json(raw)
-                result["metrics"] = metrics  # 군집/태그 근거 보존
-                diag_dump("LLM 원문(요약)", raw[:4000])
-            except Exception as e:
-                st.error(f"OpenAI 호출 오류: {e}")
-                st.stop()
+              # 🟢 수정 후: (자동 재시도 로직 및 JSON 모드 활성화)
+        with st.spinner("GPT가 리포트를 작성 중입니다... (429 오류 시 자동 재시도)"):
+            max_retries = 3
+            wait_time_seconds = 20 # TPM 한도는 1분을 기다려야 할 수 있으므로, 초기 대기 시간을 넉넉하게 설정
+            last_error = None
+            result = None
+            
+            for attempt in range(max_retries):
+                try:
+                    resp = client.chat.completions.create(
+                        model="gpt-4o",
+                        temperature=0.1,
+                        top_p=0.9,
+                        messages=[{"role":"system","content":sp},{"role":"user","content":up}],
+                        response_format={"type": "json_object"} # JSON 모드 강제 (주석 반영)
+                    )
+                    raw = resp.choices[0].message.content
+                    result = parse_llm_json(raw)
+                    result["metrics"] = metrics  # 군집/태그 근거 보존
+                    diag_dump("LLM 원문(요약)", raw[:4000])
+                    last_error = None # 성공 시 오류 기록 초기화
+                    break # 성공 시 재시도 루프 탈출
+            
+                except Exception as e:
+                    last_error = e
+                    error_message = str(e).lower()
+                    
+                    # 429 (Rate Limit) 오류 감지
+                    if "rate_limit_exceeded" in error_message or "429" in error_message:
+                        if attempt < max_retries - 1:
+                            st.warning(f"⏳ RATE LIMIT (429) 감지 (시도 {attempt + 1}/{max_retries}). {wait_time_seconds}초 후 재시도합니다.")
+                            time.sleep(wait_time_seconds)
+                            wait_time_seconds *= 2 # 대기 시간 2배 증가 (Exponential Backoff)
+                        else:
+                            st.error(f"❌ RATE LIMIT (429) 오류. 재시도({max_retries}회) 모두 실패.")
+                            st.stop()
+                    else:
+                        # 429가 아닌 다른 오류 (e.g., 400 Bad Request 등)
+                        st.error(f"❌ OpenAI 호출 중 복구 불가능한 오류 발생: {e}")
+                        st.stop()
+
+            # 최종적으로 result가 생성되지 않았다면 중단
+            if result is None:
+                st.error(f"❌ OpenAI 호출 최종 실패: {last_error}")
+                st.stop()        
 
         # 11) 엑셀 리포트 생성
         try:
@@ -442,3 +472,4 @@ if uploaded_file:
                 st.download_button("📊 Excel 리포트 다운로드", f.read(), file_name=output)
         except Exception as e:
             st.error(f"리포트 생성 오류: {e}")
+
