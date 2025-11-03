@@ -17,7 +17,8 @@ from qa_patch_module import (
     enrich_with_column_comments,
     build_system_prompt, build_user_prompt,
     parse_llm_json, write_excel_report,
-    self_check, normalize_model_name_strict
+    self_check, normalize_model_name_strict,
+    load_threaded_comments_map_from_bytes  # ★ 스레드 댓글 파서
 )
 
 # ============= 기본 설정 =============
@@ -105,7 +106,6 @@ log_hypotheses, clusters, evidence_links = [], {}, []
 # 3) Fail + 코멘트 추출 (라벨행→Fail열 세로추출, 병합셀 보정, 수식/스레드댓글 대응)
 with step_status("Fail + 셀 코멘트 추출"):
     try:
-        # 코멘트용/값용 워크북 분리
         wb_comm = openpyxl.load_workbook(io.BytesIO(data), data_only=False)
         wb_val  = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
 
@@ -115,12 +115,17 @@ with step_status("Fail + 셀 코멘트 추출"):
             st.error(f"선택한 시트를 찾을 수 없습니다. 사용 가능: {sorted(list(available))}")
             st.stop()
 
-        df_issue = extract_comments_as_dataframe_dual(wb_comm, wb_val, valid_sheets)
+        # ★ 새 댓글(스레드)까지 읽어서 보강
+        threaded_map = load_threaded_comments_map_from_bytes(data)
+
+        df_issue = extract_comments_as_dataframe_dual(
+            wb_comm, wb_val, valid_sheets, threaded_map=threaded_map
+        )
         diag_dump("추출 샘플", df_issue.head(12))
 
         if df_issue.empty:
-            st.warning("❌ Fail+코멘트 항목이 없습니다(셀 코멘트 기준).")
-            st.info("💡 팁: Fail 셀에 실제 코멘트(메모) 또는 비고/Notes를 활용하세요.")
+            st.warning("❌ Fail+코멘트 항목이 없습니다(메모/댓글 미검출).")
+            st.info("엑셀에서 해당 셀에 실제 코멘트가 존재하는지(새 댓글/메모), 보호/숨김 상태가 아닌지 확인해 주세요.")
             st.stop()
     except Exception as e:
         st.error(f"코멘트 추출 중 오류: {str(e)}")
@@ -179,7 +184,6 @@ if spec_sheets_selected:
 
         if frames:
             df_spec_all = pd.concat(frames, ignore_index=True).drop_duplicates("model_norm", keep="first")
-
             df_final["model_norm"] = df_final["Device(Model)"].apply(normalize_model_name_strict)
             df_final = pd.merge(df_final, df_spec_all, on="model_norm", how="left")
 
