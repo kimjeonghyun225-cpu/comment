@@ -4,148 +4,14 @@ QA 통합 패치 모듈 (최종)
 - 테스트 시트 자동 감지
 - 셀 코멘트 + 비고/Notes 병합
 - LLM JSON 강제(A~E 스펙, issues[] 제한 없음)
-- Excel 리포트(Executive_Summary / Summary(상세 블록) / Issues / Device_Risks / Evidence_Sample / Cluster_* (있으면))
+- Excel 리포트(Executive_Summary / Summary(상세 블록) / Issues / Device_Risks / Evidence_Sample / Cluster_*)
 - 모듈 자가진단(self_check)
 """
-
 import re
 import json
-from typing import List, Dict, Any, Optional
-# === qa_patch_module.py에 추가 ===
-import pandas as pd
-import openpyxl
 import unicodedata
-
-def _norm_for_header(s: str) -> str:
-    s = unicodedata.normalize("NFKC", str(s))
-    s = re.sub(r"[\s\-\_/()\[\]{}:+·∙•]", "", s)
-    return s.lower().strip()
-
-def find_row_by_labels(ws, labels, search_rows=30, search_cols=70):
-    max_r = min(search_rows, ws.max_row)
-    max_c = min(search_cols, ws.max_column)
-    target = set(str(x).strip() for x in labels)
-    for r in range(1, max_r + 1):
-        for c in range(1, max_c + 1):
-            v = ws.cell(row=r, column=c).value
-            if v and str(v).strip() in target:
-                return r
-    return 0
-
-def get_checklist_label(ws, row):
-    label_parts, columns_to_check = [], [6, 7, 9]
-    for c in columns_to_check:
-        for r_search in range(row, 0, -1):
-            cell_value = ws.cell(row=r_search, column=c).value
-            if cell_value and str(cell_value).strip():
-                label_parts.append(str(cell_value).replace("\n", " ").strip())
-                break
-    return " / ".join(label_parts)
-
-def extract_comments_as_dataframe(wb, target_sheet_names):
-    """Fail 셀 + 셀 코멘트를 찾아 모델/칩셋/OS 등 메타까지 묶어 DataFrame으로 반환."""
-    extracted = []
-    for sheet_name in target_sheet_names:
-        if sheet_name not in wb.sheetnames:
-            continue
-        ws = wb[sheet_name]
-        header_rows = {
-            "Model":   find_row_by_labels(ws, ["Model", "제품명"]),
-            "Chipset": find_row_by_labels(ws, ["Chipset", "CPU", "AP"]),
-            "RAM":     find_row_by_labels(ws, ["RAM", "메모리"]),
-            "Rank":    find_row_by_labels(ws, ["Rating Grade?", "Rank", "등급"]),
-            "OS":      find_row_by_labels(ws, ["OS Version", "Android", "iOS", "OS"]),
-        }
-        for row in ws.iter_rows():
-            for cell in row:
-                val = cell.value
-                if isinstance(val, str) and val.strip().lower() == "fail" and cell.comment:
-                    r, c = cell.row, cell.column
-                    device_info = {
-                        key: ws.cell(row=num, column=c).value if num > 0 else ""
-                        for key, num in header_rows.items()
-                    }
-                    checklist = get_checklist_label(ws, r)
-                    comment_text = (cell.comment.text or "").split(
-                        "https://go.microsoft.com/fwlink/?linkid=870924.", 1
-                    )[-1].strip()
-                    extracted.append({
-                        "Sheet": ws.title,
-                        "Device(Model)": device_info.get("Model", ""),
-                        "Chipset": device_info.get("Chipset", ""),
-                        "RAM": device_info.get("RAM", ""),
-                        "Rank": device_info.get("Rank", ""),
-                        "OS": device_info.get("OS", ""),
-                        "Checklist": checklist,
-                        "comment_cell": comment_text,
-                        "Comment(Text)": "",
-                    })
-    if not extracted:
-        return None
-    return pd.DataFrame(extracted)
-
-def load_std_spec_df(xls, sheet):
-    """스펙 시트의 헤더 자동탐지 → 표준 컬럼명 매핑 → model_norm 생성."""
-    # 헤더 탐지
-    df_probe = pd.read_excel(xls, sheet_name=sheet, header=None, engine="openpyxl")
-    header_row_idx = 0
-    header_candidates = [r"^model$", r"^device$", r"^제품명$", r"^제품$", r"^모델명$", r"^모델$"]
-    for r in range(min(12, len(df_probe))):
-        row_vals = df_probe.iloc[r].astype(str).fillna("")
-        norm_vals = [_norm_for_header(v) for v in row_vals]
-        for v in norm_vals:
-            if any(re.search(pat, v) for pat in header_candidates):
-                header_row_idx = r; break
-        if header_row_idx:
-            break
-
-    df = pd.read_excel(xls, sheet_name=sheet, header=header_row_idx, engine="openpyxl")
-    # 표준화
-    original_cols = list(df.columns)
-    norm_cols = [_norm_for_header(c) for c in original_cols]
-    synonyms = {
-        r"^(model|device|제품명|제품|모델명|모델)$": "Model",
-        r"^(maker|manufacturer|brand|oem|제조사|벤더)$": "제조사",
-        r"^(gpu|그래픽|그래픽칩|그래픽스|그래픽프로세서)$": "GPU",
-        r"^(chipset|soc|ap|cpu)$": "Chipset",
-        r"^(ram|메모리)$": "RAM",
-        r"^(os|osversion|android|ios|펌웨어|소프트웨어버전)$": "OS",
-        r"^(rank|rating|ratinggrade|등급)$": "Rank",
-    }
-    col_map = {}
-    for norm_name, orig_name in zip(norm_cols, original_cols):
-        mapped = None
-        for pat, std_name in synonyms.items():
-            if re.search(pat, norm_name):
-                mapped = std_name; break
-        col_map[orig_name] = mapped or orig_name
-    df = df.rename(columns=col_map)
-
-    # model_norm
-    def normalize_model_name_strict(s):
-        if pd.isna(s): return ""
-        s = str(s)
-        s = re.sub(r"\(.*?\)", "", s)
-        s = re.sub(r"\b(64|128|256|512)\s*gb\b", "", s, flags=re.I)
-        s = re.sub(r"\b(black|white|blue|red|green|gold|silver|골드|블랙|화이트|실버)\b", "", s, flags=re.I)
-        s = re.sub(r"[\s\-_]+", "", s)
-        return s.lower().strip()
-
-    model_col = "Model" if "Model" in df.columns else None
-    if model_col is None:
-        for c in df.columns:
-            if re.search(r"^(model|device|제품명|제품|모델명|모델)$", _norm_for_header(c)):
-                model_col = c; break
-    if model_col is None:
-        raise ValueError(f"'{sheet}'에서 모델 컬럼을 찾지 못했습니다. 컬럼: {list(df.columns)}")
-
-    df["model_norm"] = df[model_col].apply(normalize_model_name_strict)
-    cols_keep = ["model_norm"]
-    for c in ["GPU","제조사","Chipset","RAM","OS","Rank","Model"]:
-        if c in df.columns:
-            cols_keep.append(c)
-    return df[cols_keep]
-
+from typing import List, Dict, Any, Optional
+import pandas as pd
 
 # ==============================
 # 테스트 시트 자동 감지
@@ -181,14 +47,13 @@ def find_test_sheet_candidates(xls) -> list:
     return sorted(cands) if cands else names
 
 # ==============================
-# 코멘트 확장(셀 코멘트 + 비고열)
+# 내부 유틸
 # ==============================
 def _nkfc(s: Any) -> str:
     if pd.isna(s): return ""
-    import re as _re
     s = str(s)
-    s = _re.sub(r"\s+", "", s)
-    s = _re.sub(r"[_\-\/(){}\[\]:+·∙•]", "", s)
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"[_\-\/(){}\[\]:+·∙•]", "", s)
     return s.strip().lower()
 
 def _safe_series(df: pd.DataFrame, col: str) -> pd.Series:
@@ -202,6 +67,9 @@ def _pick_first_nonempty(*series):
         out.loc[mask] = s2.loc[mask]
     return out
 
+# ==============================
+# 코멘트 확장(셀 코멘트 + 비고열)
+# ==============================
 def enrich_with_column_comments(
     xls,
     test_sheet_name: str,
@@ -357,7 +225,7 @@ def build_user_prompt(
         "3) 디바이스 리스크(조합·원인 추정)\n"
         "4) 액션플랜(담당/기한/검증기준)\n"
         "5) 릴리스 권고(Go/No-Go/Conditional + 조건)\n"
-        "※ clusters_detailed는 이미 계열×증상 군집과 증거 샘플을 포함합니다. 이를 근거로 요약만 하십시오.\n"
+        "※ clusters_feature_detailed / by_issue_tag 를 활용해 GPU/CPU 외 공통 이슈도 요약하라.\n"
         "[형식] JSON { summary, issues[], device_risks[], actions[], release_decision, conditions }"
     )
     return (
@@ -388,34 +256,120 @@ def parse_llm_json(text: str) -> Dict[str, Any]:
     return obj
 
 # ------------------------------
-# Summary 상세 블록 빌더 (현상/기기/영향/원인 추정/권고)
+# Summary 상세 블록 빌더
+#   - 일반 이슈(제목 없이 5줄)
+#   - GPU/CPU 군집(있을 때)
+#   - Feature(펀치홀/노치/회전/설치/권한/입력지연 등) 군집
 # ------------------------------
-def build_summary_block(issues: List[Dict[str, Any]], topn: int = 3) -> str:
+_DEVICE_PAT = re.compile(r"(Galaxy\s?[A-Z0-9\-]+|SM\-[A-Z0-9]+|iPhone\s?[A-Z0-9\-+ ]+|Pixel\s?\d+(?:\sPro)?|Redmi\s?[A-Z0-9\-]+|Xiaomi\s?[A-Z0-9\-]+|OPPO\s?[A-Z0-9\-]+|VIVO\s?[A-Z0-9\-]+)", re.I)
+
+def _pick_devices_from_evidence(evidence_list, fallback_models=None, topn=3):
+    devices = []
+    for e in evidence_list or []:
+        m = _DEVICE_PAT.findall(str(e) or "")
+        for v in m:
+            v = str(v).strip()
+            if v and v not in devices:
+                devices.append(v)
+        if len(devices) >= topn:
+            break
+    if (not devices) and fallback_models:
+        for v in fallback_models:
+            v = str(v).strip()
+            if v and v not in devices:
+                devices.append(v)
+            if len(devices) >= topn:
+                break
+    return ", ".join(devices[:topn]) if devices else ""
+
+def build_summary_block(
+    issues: List[Dict[str, Any]],
+    topn: int = 100,
+    metrics: Optional[Dict[str, Any]] = None,
+) -> str:
     lines = []
+
+    # [A] 일반 이슈
     for i, iss in enumerate(issues or [], start=1):
         if i > topn: break
-        title  = iss.get("title","이슈")
-        symp   = iss.get("symptom","")
-        impact = iss.get("impact","")
-        cause  = iss.get("cause","(추정 근거 부족)")
-        rec    = iss.get("recommendation","")
-        # 발생 기기(간단 추출: evidence에서 모델명 포함 라인 사용)
-        dev_line = ""
-        for e in iss.get("evidence",[]) or []:
-            if any(k in str(e) for k in ["Galaxy","Xiaomi","iPhone","OPPO","VIVO","Redmi","Pixel","SM-"]):
-                dev_line = str(e); break
-        if not dev_line and (iss.get("evidence") or []):
-            dev_line = str(iss["evidence"][0])
-        block = (
-            f"{title}\n"
-            f"* 현상: {symp}\n"
-            f"* 발생 기기: {dev_line}\n"
-            f"* 영향: {impact}\n"
-            f"* 원인 추정: {cause}\n"
-            f"* 권고: {rec}"
+        symp   = (iss.get("symptom") or "").strip()
+        impact = (iss.get("impact") or "").strip()
+        cause  = (iss.get("cause") or "").strip()
+        rec    = (iss.get("recommendation") or "").strip()
+        devices = _pick_devices_from_evidence(
+            iss.get("evidence", []),
+            fallback_models=iss.get("repr_models") or [],
+            topn=3
         )
+        block = "\n".join([
+            f"* 현상: {symp or '(미기재)'}",
+            f"* 발생 기기: {devices}",
+            f"* 영향: {impact or '(미기재)'}",
+            f"* 원인 추정: {cause or '(미기재)'}",
+            f"* 권고: {rec or '(미기재)'}",
+        ])
         lines.append(block.strip())
-    return ("\n\n---\n\n".join(lines)).strip()
+        lines.append("---")
+
+    # [B] Feature 군집 (비GPU/CPU: punch_hole, notch, rotation 등)
+    if isinstance(metrics, dict):
+        fcd = metrics.get("clusters_feature_detailed") or []
+        for c in fcd:
+            tag  = (c.get("feature_tag") or "").strip()
+            patt = (c.get("pattern") or tag or "공통 UI/디스플레이 이슈").strip()
+            evidence_list = []
+            for ev in c.get("evidence_rows", []):
+                if isinstance(ev, dict):
+                    evidence_list.append(ev.get("comment") or ev.get("device") or "")
+                else:
+                    evidence_list.append(str(ev))
+            devices = _pick_devices_from_evidence(
+                evidence_list,
+                fallback_models=c.get("repr_models") or [],
+                topn=3
+            )
+            title_map = {
+                "punch_hole": "펀치홀 디바이스 공통",
+                "notch": "노치 디바이스 공통",
+                "rotation": "화면 회전 공통",
+                "aspect_ratio": "화면비/레이아웃 공통",
+                "resolution": "해상도/스케일링 공통",
+                "cutout": "디스플레이 컷아웃 공통",
+                "install": "설치/패키지 공통",
+                "permission": "권한/퍼미션 공통",
+                "login": "로그인/인증 공통",
+                "input_lag": "입력/터치 지연 공통",
+                "keyboard": "키보드/IME 공통",
+                "ui_scaling": "UI 스케일링 공통",
+                "render_artifact": "렌더링 아티팩트 공통",
+                "black_screen": "검은 화면 공통",
+                "white_screen": "하얀 화면 공통",
+                "crash": "크래시 공통",
+                "network": "네트워크/SSL 공통",
+                "audio": "오디오 공통",
+                "camera": "카메라 공통",
+                "thermal": "써멀/발열 공통",
+                "fps": "프레임 저하 공통",
+            }
+            title = title_map.get(tag, f"{tag} 공통 이슈")
+            symp   = patt
+            impact = "사용자 경험 저하"
+            cause  = f"{title} 환경에서의 공통 처리/레이아웃 대응 부족 가능"
+            rec    = f"{title} 대응 로직 보강 및 회귀 검증"
+            block = "\n".join([
+                f"{title}",
+                f"* 현상: {symp}",
+                f"* 발생 기기: {devices}",
+                f"* 영향: {impact}",
+                f"* 원인 추정: {cause}",
+                f"* 권고: {rec}",
+            ])
+            lines.append(block.strip())
+            lines.append("---")
+
+    while lines and lines[-1] == "---":
+        lines.pop()
+    return "\n\n".join(lines).strip()
 
 def write_excel_report(result: Dict[str, Any], df_final: pd.DataFrame, path: str) -> None:
     # 엔진 자동 선택
@@ -430,7 +384,7 @@ def write_excel_report(result: Dict[str, Any], df_final: pd.DataFrame, path: str
             raise RuntimeError("엑셀 작성 엔진이 없습니다. `pip install xlsxwriter` 또는 `pip install openpyxl`")
 
     with pd.ExcelWriter(path, engine=engine) as wr:
-        # 0) Executive_Summary (요약표: A/C/E 중심)
+        # 0) Executive_Summary
         exec_rows = [{
             "A. 한 줄 총평": result.get("summary",""),
             "C. 디바이스 리스크": " / ".join([d.get("device_model_or_combo","") for d in (result.get("device_risks") or [])][:5]),
@@ -438,8 +392,12 @@ def write_excel_report(result: Dict[str, Any], df_final: pd.DataFrame, path: str
         }]
         pd.DataFrame(exec_rows).to_excel(wr, sheet_name="Executive_Summary", index=False)
 
-        # 1) Summary — 상세 블록(현상/기기/영향/원인 추정/권고)
-        summary_text = build_summary_block(result.get("issues", []), topn=100)
+        # 1) Summary — 상세 블록(일반 이슈 + Feature 군집)
+        summary_text = build_summary_block(
+            result.get("issues", []),
+            topn=100,
+            metrics=result.get("metrics")
+        )
         if not summary_text:
             summary_text = (
                 f"릴리스 권고: {result.get('release_decision','')} / 조건: {result.get('conditions','')}\n"
@@ -447,7 +405,7 @@ def write_excel_report(result: Dict[str, Any], df_final: pd.DataFrame, path: str
             )
         pd.DataFrame([{"Summary & Insight": summary_text}]).to_excel(wr, sheet_name="Summary", index=False)
 
-        # 2) Issues (제한 없음)
+        # 2) Issues
         issues = pd.DataFrame(result.get("issues", []))
         if issues.empty:
             pd.DataFrame([{"title":"(없음)"}]).to_excel(wr, sheet_name="Issues", index=False)
@@ -458,7 +416,7 @@ def write_excel_report(result: Dict[str, Any], df_final: pd.DataFrame, path: str
         risks = pd.DataFrame(result.get("device_risks", []))
         risks.to_excel(wr, sheet_name="Device_Risks", index=False)
 
-        # 4) Evidence_Sample(원본 일부)
+        # 4) Evidence_Sample
         cols = [c for c in ["Sheet","Device(Model)","GPU","Chipset","RAM","OS","Rank","Checklist","comment_text"] if c in df_final.columns]
         if cols:
             disp = df_final[cols].head(200).copy()
@@ -469,49 +427,26 @@ def write_excel_report(result: Dict[str, Any], df_final: pd.DataFrame, path: str
         else:
             pd.DataFrame().to_excel(wr, sheet_name="Evidence_Sample", index=False)
 
-        # (선택) 5) Cluster_* 시트: metrics에 따라 유연 기록
+        # 5) Cluster_*: by_issue_tag / clusters_feature_detailed 등
         metrics_in_result = result.get("metrics", {}) if isinstance(result, dict) else {}
-        # ① 기존 호환: metrics["clusters"]가 dict인 경우
-        clusters_old = metrics_in_result.get("clusters", {}) if isinstance(metrics_in_result, dict) else {}
-        wrote_any = False
-        if isinstance(clusters_old, dict) and clusters_old:
-            for key, rows in clusters_old.items():
+        clusters = metrics_in_result.get("clusters", {})
+        if isinstance(clusters, dict) and clusters:
+            for key, rows in clusters.items():
                 try:
                     pd.DataFrame(rows).to_excel(wr, sheet_name=f"Cluster_{key}", index=False)
-                    wrote_any = True
                 except Exception:
                     pass
 
-        # ② 신규 키: by_gpu_family / by_gpu / by_chipset / clusters_detailed
-        by_gpu_family = metrics_in_result.get("by_gpu_family", [])
-        by_gpu = metrics_in_result.get("by_gpu", [])
-        by_chipset = metrics_in_result.get("by_chipset", [])
-        clusters_detailed = metrics_in_result.get("clusters_detailed", [])
+        by_issue_tag = metrics_in_result.get("by_issue_tag", [])
+        if by_issue_tag:
+            try:
+                pd.DataFrame(by_issue_tag).to_excel(wr, sheet_name="Cluster_by_issue_tag", index=False)
+            except Exception:
+                pass
 
-        try:
-            if by_gpu_family:
-                pd.DataFrame(by_gpu_family).to_excel(wr, sheet_name="Cluster_by_gpu_family", index=False)
-                wrote_any = True
-        except Exception:
-            pass
-        try:
-            if by_gpu:
-                pd.DataFrame(by_gpu).to_excel(wr, sheet_name="Cluster_by_gpu", index=False)
-                wrote_any = True
-        except Exception:
-            pass
-        try:
-            if by_chipset:
-                pd.DataFrame(by_chipset).to_excel(wr, sheet_name="Cluster_by_chipset", index=False)
-                wrote_any = True
-        except Exception:
-            pass
-        try:
-            if clusters_detailed:
-                pd.DataFrame(clusters_detailed).to_excel(wr, sheet_name="Cluster_detailed", index=False)
-                wrote_any = True
-        except Exception:
-            pass
-        # wrote_any가 False여도 에러는 아님(클러스터 데이터가 없을 수 있음)
-
-
+        clusters_feature = metrics_in_result.get("clusters_feature_detailed", [])
+        if clusters_feature:
+            try:
+                pd.DataFrame(clusters_feature).to_excel(wr, sheet_name="Cluster_feature_detailed", index=False)
+            except Exception:
+                pass
