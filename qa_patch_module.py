@@ -223,6 +223,7 @@ def build_user_prompt(
         "3) 디바이스 리스크(조합·원인 추정)\n"
         "4) 액션플랜(담당/기한/검증기준)\n"
         "5) 릴리스 권고(Go/No-Go/Conditional + 조건)\n"
+        "※ clusters_detailed는 이미 계열×증상 군집과 증거 샘플을 포함합니다. 이를 근거로 요약만 하십시오.\n"
         "[형식] JSON { summary, issues[], device_risks[], actions[], release_decision, conditions }"
     )
     return (
