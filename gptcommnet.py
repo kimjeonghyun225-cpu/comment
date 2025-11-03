@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-# 최종 Streamlit 앱: QA 결과 자동 코멘트 생성기 (헤더자동탐지/동의어매핑/모델정규화 적용)
+# comment1.py — 프로젝트명 입력 없이, 세션 초기화 버튼으로 런→리셋→재분석 플로우
+# Fail 리스트 → 스펙 병합 → 코멘트/스펙 정규화 → 군집화 → GPT 요약 → Excel 리포트
 
 import os
 import re
@@ -20,8 +21,11 @@ from qa_patch_module import (
     enrich_with_column_comments,
     build_system_prompt, build_user_prompt,
     parse_llm_json, write_excel_report,
-    self_check
+    self_check,
+    load_std_spec_df,                 # ✅ 스펙 병합 유틸
+    extract_comments_as_dataframe     # ✅ Fail+코멘트(메타 포함) 추출
 )
+
 # =========================
 # 환경설정
 # =========================
@@ -36,17 +40,11 @@ client = OpenAI(api_key=api_key)
 
 st.set_page_config(page_title="QA 결과 자동 코멘트 생성기", layout="wide")
 st.title(":bar_chart: QA 결과 자동 코멘트 생성기")
-# ▼ 프로젝트/버전 입력 UI (이 줄을 st.title 아래에 추가)
-col_pj, col_ver, col_reset = st.columns([2, 2, 1])
-with col_pj:
-    project_name = st.text_input("프로젝트명", value="", placeholder="예: AOD v1.3 CO")
-with col_ver:
-    checklist_version = st.text_input("체크리스트 버전", value="", placeholder="예: r1.2.0")
-with col_reset:
-    if st.button("🔄 세션 초기화"):
-        st.session_state.clear()
-        st.experimental_rerun()
 
+# 세션 초기화 버튼만 사용 (프로젝트명 입력 UI 없음)
+if st.button("🔄 세션 초기화"):
+    st.session_state.clear()
+    st.experimental_rerun()
 
 # =========================
 # 공통 유틸
@@ -66,9 +64,6 @@ def diag_dump(label: str, obj):
     with st.expander(f"🔎 진단 보기: {label}", expanded=False):
         st.write(obj)
 
-# =========================
-# 공통 유틸
-# =========================
 def _norm(s: str) -> str:
     s = unicodedata.normalize("NFKC", str(s))
     s = re.sub(r"[\s\-\_/()\[\]{}:+·∙•]", "", s)
@@ -84,7 +79,7 @@ def normalize_model_name_strict(s):
     return s.lower().strip()
 
 # =========================
-# Log 분석: 요약 + 근본 원인 추정
+# Log 분석: 요약 + 근본 원인 추정 (현재 업로드 비활성)
 # =========================
 def load_and_summarize_logcat_files(files):
     patterns = {
@@ -160,15 +155,11 @@ def infer_root_causes_from_logs(summary: str) -> list:
     return hyps
 
 # =========================
-# 나머지 메인 파이프라인
-# =========================
-# (아래 생략 없이 전체 - 군집 통계, LLM 호출, 보고서 생성 모두 동일)
-# =========================
-# UI: 파일 업로드 및 실행
+# UI: 파일 업로드
 # =========================
 uploaded_file = st.file_uploader("원본 QA 엑셀 파일을 업로드하세요", type=["xlsx"])
-log_files = None #st.file_uploader("Logcat 파일 업로드(.txt/.log 또는 .zip, 다중 가능)", type=["txt", "log", "zip"], accept_multiple_files=True)
-st.caption("※ Logcat 분석은 현재 비활성화 상태입니다.")
+log_files = None   # 필요 시 활성화
+st.caption("※ Logcat 분석은 현재 비활성화 상태입니다. (세션 초기화 후 새 파일로 재분석하세요)")
 
 if uploaded_file:
     with step_status("엑셀 로드"):
@@ -201,101 +192,209 @@ if uploaded_file:
     st.markdown("---")
 
     if st.button("분석 및 리포트 생성", type="primary"):
-        # 🔒 실행별 상태 초기화 (이전 실행 값 섞임 방지)
+        # 실행별 상태변수 초기화 (다른 프로젝트 결과 섞임 방지)
         log_summary = {}
         log_hypotheses = []
         clusters = {}
         evidence_links = []
 
-
-        # 3) Fail+코멘트 추출
+        # 3) Fail + 셀 코멘트 추출
         with step_status("Fail + 셀 코멘트 추출"):
             wb = openpyxl.load_workbook(uploaded_file, data_only=True)
-            df_issue = None
-            try:
-                from qa_patch_module import enrich_with_column_comments
-                df_issue = pd.DataFrame()
-                tmp = []
-                for s in test_sheets_selected:
-                    ws = wb[s]
-                    for row in ws.iter_rows():
-                        for cell in row:
-                            if isinstance(cell.value, str) and cell.value.lower() == "fail" and cell.comment:
-                                tmp.append({
-                                    "Sheet": s,
-                                    "Checklist": ws.title,
-                                    "Device(Model)": "",
-                                    "comment_cell": cell.comment.text.strip()
-                                })
-                df_issue = pd.DataFrame(tmp)
-            except Exception:
-                pass
-            if df_issue is None or df_issue.empty:
-                st.warning("❌ Fail+코멘트 항목이 없습니다.")
-                st.stop()
+            df_issue = extract_comments_as_dataframe(wb, test_sheets_selected)
+            diag_dump("Fail 추출 샘플(최대 10)", df_issue.head(10) if df_issue is not None else None)
+
+        if df_issue is None or df_issue.empty:
+            st.warning("❌ Fail+코멘트 항목을 찾지 못했습니다.")
+            st.stop()
 
         # 4) 비고/Notes 병합
         with step_status("비고/Notes 병합"):
             df_issue = enrich_with_column_comments(xls, test_sheets_selected[0], df_issue)
             diag_dump("병합 결과 샘플", df_issue.head(10))
 
-        # 5) 자가진단
+        # 5) 스펙 시트 병합
+        df_final = df_issue.copy()
+        match_rate = 0.0
+        if spec_sheets_selected:
+            with step_status("스펙 병합"):
+                try:
+                    spec_frames = [load_std_spec_df(xls, s) for s in spec_sheets_selected]
+                    df_spec_all = pd.concat(spec_frames, ignore_index=True).drop_duplicates(subset=["model_norm"], keep="first")
+
+                    df_final["model_norm"] = df_final["Device(Model)"].apply(normalize_model_name_strict)
+                    df_final = pd.merge(df_final, df_spec_all, on="model_norm", how="left")
+
+                    for col in ["GPU","제조사","Chipset","RAM","OS","Rank","Model"]:
+                        cx, cy = f"{col}_x", f"{col}_y"
+                        if cx in df_final.columns and cy in df_final.columns:
+                            df_final[col] = df_final[cx].where(df_final[cx].notna(), df_final[cy])
+                            df_final.drop(columns=[cx, cy], inplace=True)
+                        elif cx in df_final.columns:
+                            df_final.rename(columns={cx: col}, inplace=True)
+                        elif cy in df_final.columns:
+                            df_final.rename(columns={cy: col}, inplace=True)
+
+                    if "GPU" in df_final.columns:
+                        matched = int(df_final["GPU"].notna().sum())
+                        match_rate = round(matched / len(df_final) * 100, 1)
+                        st.success(f"스펙 매칭 결과: {matched} / {len(df_final)} 건 ({match_rate}%)")
+                except Exception as e:
+                    st.error(f"스펙 병합 중 오류: {e}")
+        else:
+            df_final = df_issue.copy()
+
+        # 6) 모듈 자가진단
         with step_status("모듈 자가진단"):
-            diag = self_check(df_issue)
+            diag = self_check(df_final)
             diag_dump("self_check 결과", diag)
             if not diag["row_ok"]:
                 st.error("❌ 유효한 데이터 없음. 중단.")
                 st.stop()
 
-        df_final = df_issue.copy()
+        # 7) 코멘트 정리 + GPU 정규화/계열 분류 + Chipset 기반 보강
+        def clean_comment_text(s: str) -> str:
+            if pd.isna(s): return ""
+            t = str(s)
+            t = re.sub(r"https?://go\.microsoft\.com/.*", " ", t)
+            t = re.sub(r"Excel에서 이 스레드 댓글을.*?자세한 정보.*?:", " ", t)
+            t = re.sub(r"\s+", " ", t).strip(" -:|,.;\n\t")
+            for pat, rep in [
+                (r"프레임\s*드랍|프레임드랍|프레임\s*저하|프레임\s*하락", "프레임 드랍"),
+                (r"렉|랙|버벅|버벅임|끊김|지연", "입력 지연"),
+                (r"발열|과열", "발열"),
+                (r"크래시|강제종료|튕김", "크래시"),
+                (r"텍스처\s*깨짐|그래픽\s*깨짐|렌더링\s*오류", "그래픽 깨짐"),
+                (r"화면\s*회전\s*불가|회전\s*안됨", "화면 회전 문제"),
+                (r"ANR|응답없음", "ANR"),
+            ]:
+                t = re.sub(pat, rep, t, flags=re.I)
+            return t
 
-        # 6) Logcat 요약 + 원인추정
-        with step_status("Logcat 분석"):
-            log_summary, log_hypotheses = {}, []
-            if log_files:
-                log_summary = load_and_summarize_logcat_files(log_files)
-                st.info(f"Logcat 요약: {log_summary.get('log_summary','-')}")
-                log_hypotheses = infer_root_causes_from_logs(log_summary.get("log_summary", ""))
-                diag_dump("로그 근본 원인 가설", log_hypotheses)
-            else:
-                st.info("로그 파일 없음. Logcat 분석 생략.")
+        df_final["comment_text_norm"] = df_final.get("comment_text", "").astype(str).apply(clean_comment_text)
 
-        # 7) 군집 통계
+        def normalize_gpu_name(s: str) -> str:
+            if pd.isna(s) or not str(s).strip(): return ""
+            x = str(s).strip().replace("–","-").replace("—","-").replace("_"," ")
+            x = re.sub(r"\s+"," ", x)
+            x = re.sub(r"\bPower\s*VR\b", "PowerVR", x, flags=re.I)
+            x = re.sub(r"\bIMG\s+GE", "PowerVR GE", x, flags=re.I)
+            x = re.sub(r"\bIMG\s+GT", "PowerVR GT", x, flags=re.I)
+            x = re.sub(r"\bGE(\d+)\b", r"PowerVR GE\1", x, flags=re.I)
+            x = re.sub(r"\bGT(\d+)\b", r"PowerVR GT\1", x, flags=re.I)
+            x = re.sub(r"\bAdreno\s*-?\s*(\d+)", r"Adreno \1", x, flags=re.I)
+            x = re.sub(r"\bMali[\s\-]*G\s*(\d+)\s*MP?\s*(\d+)\b", r"Mali-G\1 MP\2", x, flags=re.I)
+            x = re.sub(r"\bMali[\s\-]*G\s*(\d+)\b", r"Mali-G\1", x, flags=re.I)
+            x = re.sub(r"\bMali[\s\-]*T\s*(\d+)\s*MP?\s*(\d+)\b", r"Mali-T\1 MP\2", x, flags=re.I)
+            x = re.sub(r"\bMali[\s\-]*T\s*(\d+)\b", r"Mali-T\1", x, flags=re.I)
+            x = re.sub(r"\bApple\s*(GPU)?\s*\(?(\d+)\s*[- ]?core\)?", r"Apple GPU \2-core", x, flags=re.I)
+            x = re.sub(r"\bVivante\s*(GC|GT)\s*(\d+)", r"Vivante \1\2", x, flags=re.I)
+            x = re.sub(r"\bTegra\s*(K1|X1|X2)\b", r"Tegra \1", x, flags=re.I)
+            return x
+
+        def classify_gpu_family(x: str) -> str:
+            y = (x or "").lower()
+            if "adreno" in y: return "Adreno"
+            if "mali" in y: return "Mali"
+            if "powervr" in y or "img ge" in y or "img gt" in y: return "PowerVR"
+            if "apple gpu" in y: return "Apple"
+            if "vivante" in y: return "Vivante"
+            if "tegra" in y or "nvidia" in y: return "Tegra"
+            return "Other" if y else ""
+
+        def infer_gpu_from_chipset(s: str) -> str:
+            t = ("" if pd.isna(s) else str(s)).lower()
+            if not t: return ""
+            if "snapdragon" in t or "qualcomm" in t: return "Adreno (inferred)"
+            if "mediatek" in t or "dimensity" in t or "helio" in t: return "Mali (inferred)"
+            if "exynos" in t: return "Mali (inferred)"
+            if "kirin" in t or "hisilicon" in t: return "Mali (inferred)"
+            if re.search(r"\bapple\s*a\d+\b", t): return "Apple GPU (inferred)"
+            if "unisoc" in t or "spreadtrum" in t: return "Mali (inferred)"
+            return ""
+
+        df_final["GPU"] = df_final.get("GPU","").astype(str).apply(normalize_gpu_name)
+        miss = df_final["GPU"].eq("") | df_final["GPU"].isna()
+        if "Chipset" in df_final.columns and miss.any():
+            df_final.loc[miss, "GPU"] = df_final.loc[miss, "Chipset"].apply(infer_gpu_from_chipset)
+        df_final["GPU_Family"] = df_final["GPU"].apply(classify_gpu_family)
+
+        # 8) 군집(Cluster) 통계 + 상세(계열×증상) 생성
         with step_status("군집(Cluster) 통계 산출"):
-            def _cluster_counts(df, col, topn=15):
+            def _cluster_counts(df, col, topn=20):
                 if col not in df.columns:
-                    return pd.DataFrame(columns=[col, "count"])
-                vc = df[col].fillna("(미기재)").astype(str).str.strip().value_counts().head(topn)
+                    st.info(f"군집 스킵: '{col}' 없음"); return pd.DataFrame(columns=[col,"count"])
+                nn = int(df[col].replace("", pd.NA).notna().sum())
+                if nn == 0:
+                    st.info(f"군집 스킵: '{col}' 모두 결측"); return pd.DataFrame(columns=[col,"count"])
+                vc = (df[col].fillna("(미기재)").astype(str).str.strip()
+                      .replace("", "(미기재)").value_counts().head(topn))
                 return vc.reset_index().rename(columns={"index": col, 0: "count"})
-            cluster_gpu = _cluster_counts(df_final, "GPU")
-            cluster_chip = _cluster_counts(df_final, "Chipset")
-            clusters = {
-                "by_gpu": cluster_gpu.to_dict(orient="records"),
-                "by_chipset": cluster_chip.to_dict(orient="records"),
-            }
-            diag_dump("GPU/Chipset 군집 통계", clusters)
 
-        # 8) 프롬프트 준비
+            cluster_gpu_family = _cluster_counts(df_final, "GPU_Family")
+            cluster_gpu_model  = _cluster_counts(df_final, "GPU")
+            cluster_chip       = _cluster_counts(df_final, "Chipset")
+
+            def build_signature(s: str) -> str:
+                t = ("" if pd.isna(s) else str(s)).lower()
+                keep = []
+                for kw in ["프레임 드랍","그래픽 깨짐","입력 지연","크래시","발열","화면 회전 문제","anr","네트워크","사운드","로딩 지연","메모리"]:
+                    if kw in t: keep.append(kw)
+                return " | ".join(sorted(set(keep))) or t[:40]
+
+            df_final["issue_signature"] = df_final["comment_text_norm"].apply(build_signature)
+
+            def top_models(s, n=3):
+                return [str(x) for x in pd.Series(s).dropna().astype(str).head(n)]
+
+            grp = (df_final
+                   .groupby(["GPU_Family","issue_signature"], dropna=False)
+                   .agg(count=("issue_signature","size"),
+                        repr_models=("Device(Model)", lambda s: top_models(s, 3)),
+                        evidence_rows=("comment_text_norm", lambda s: [str(x) for x in pd.Series(s).dropna().astype(str).head(3)]))
+                   .reset_index()
+                   .sort_values("count", ascending=False))
+
+            clusters = {
+                "by_gpu_family": cluster_gpu_family.to_dict(orient="records"),
+                "by_gpu":        cluster_gpu_model.to_dict(orient="records"),
+                "by_chipset":    cluster_chip.to_dict(orient="records"),
+                "detailed": [
+                    {
+                        "dimension": "GPU_Family",
+                        "value": r["GPU_Family"] or "",
+                        "signature": r["issue_signature"] or "",
+                        "count": int(r["count"]),
+                        "repr_models": r["repr_models"],
+                        "evidence_rows": r["evidence_rows"]
+                    }
+                    for _, r in grp.iterrows() if r["count"] >= 2
+                ]
+            }
+            diag_dump("군집 통계/상세", clusters)
+
+        # 9) 프롬프트 준비 (프로젝트/버전은 빈값으로 전달)
         metrics = {
             "total_fail_issues": len(df_final),
-            "clusters": clusters,
-            "log_hypotheses": log_hypotheses
+            "by_gpu_family": clusters["by_gpu_family"],
+            "by_gpu": clusters["by_gpu"],
+            "by_chipset": clusters["by_chipset"],
+            "clusters_detailed": clusters["detailed"],
+            "log_hypotheses": []  # log_files 비활성 상태
         }
         deltas, evidence_links = {}, []
-        if log_summary:
-            evidence_links.append(f"Log Summary: {log_summary.get('log_summary','')}")
 
         base_kwargs = {
-            "project": (project_name.strip() or "UNKNOWN_PROJECT"),
-            "version": (checklist_version.strip() or "UNKNOWN_VERSION"),
+            "project": "",                 # ✅ 프로젝트명 미사용
+            "version": "",                 # ✅ 버전 미사용
             "metrics": metrics,
             "deltas": deltas,
             "evidence_links": evidence_links,
             "sample_issues": df_final,
-            "max_rows": 500  # 필요 시 늘림
+            "max_rows": 500
         }
 
-        # 9) 토큰 예산 자동 조정
+        # 10) 토큰 예산 자동 조정
         def _rough_token_count(t: str) -> int:
             return max(1, int(len(t) / 2.5))
         def estimate_tokens(msgs: list) -> int:
@@ -322,7 +421,7 @@ if uploaded_file:
             sp, up, diag_budget = fit_prompt(build_user_prompt, base_kwargs)
             diag_dump("토큰 진단", diag_budget)
 
-        # 10) OpenAI 호출
+        # 11) OpenAI 호출
         with st.spinner("GPT가 리포트를 작성 중입니다..."):
             try:
                 resp = client.chat.completions.create(
@@ -333,13 +432,13 @@ if uploaded_file:
                 )
                 raw = resp.choices[0].message.content
                 result = parse_llm_json(raw)
-                result["metrics"] = metrics  # 군집·로그 근거 보존
+                result["metrics"] = metrics
                 diag_dump("LLM 원문(요약)", raw[:4000])
             except Exception as e:
                 st.error(f"OpenAI 호출 오류: {e}")
                 st.stop()
 
-        # 11) 엑셀 리포트 생성
+        # 12) 엑셀 리포트 생성
         try:
             output = "QA_Report.xlsx"
             write_excel_report(result, df_final, output)
@@ -348,4 +447,3 @@ if uploaded_file:
                 st.download_button("📊 Excel 리포트 다운로드", f.read(), file_name=output)
         except Exception as e:
             st.error(f"리포트 생성 오류: {e}")
-
