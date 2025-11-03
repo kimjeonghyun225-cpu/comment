@@ -53,9 +53,33 @@ with step_status("엑셀 로드"):
     xls = pd.ExcelFile(io.BytesIO(data), engine="openpyxl")
     diag_dump("시트 목록", xls.sheet_names)
 
+with step_status("엑셀 로드"):
+    try:
+        xls = pd.ExcelFile(io.BytesIO(data), engine="openpyxl")
+        diag_dump("시트 목록", xls.sheet_names)
+    except Exception as e:
+        st.error(f"엑셀 파일 로드 실패: {e}")
+        st.stop()
+
 with step_status("테스트 시트 자동감지"):
-    test_candidates = find_test_sheet_candidates(xls)
-    diag_dump("감지된 후보 시트", test_candidates)
+    try:
+        # xls 객체가 제대로 생성되었는지 확인
+        if not hasattr(xls, 'sheet_names') or xls.sheet_names is None:
+            st.error("엑셀 파일에서 시트 정보를 읽을 수 없습니다.")
+            st.stop()
+        
+        test_candidates = find_test_sheet_candidates(xls)
+        
+        # 결과가 비어있으면 모든 시트 사용
+        if not test_candidates:
+            test_candidates = xls.sheet_names
+            
+        diag_dump("감지된 후보 시트", test_candidates)
+    except Exception as e:
+        st.error(f"테스트 시트 감지 오류: {e}")
+        st.write("전체 시트 목록:", xls.sheet_names)
+        # 에러 발생 시 모든 시트를 후보로 사용
+        test_candidates = xls.sheet_names if hasattr(xls, 'sheet_names') else []
 
 st.subheader("1. 테스트 시트 선택")
 test_sheets_selected = st.multiselect(
@@ -382,4 +406,5 @@ try:
         st.download_button("📊 Excel 리포트 다운로드", f.read(), file_name=output)
 except Exception as e:
     st.error(f"리포트 생성 오류: {e}")
+
 
