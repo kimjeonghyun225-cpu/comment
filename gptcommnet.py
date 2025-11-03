@@ -405,7 +405,7 @@ if uploaded_file:
             except Exception:
                 return sum(_rough_token_count(m.get("content","")) for m in msgs)
 
-        def fit_prompt(build_user, base_kwargs, model_budget=30000, reserve_output=6000):
+        def fit_prompt(build_user, base_kwargs, model_budget=200000, reserve_output=6000):
             max_rows_list = [800, 600, 400, 300, 200, 100]
             df = base_kwargs["sample_issues"]
             for mr in max_rows_list:
@@ -441,7 +441,7 @@ if uploaded_file:
             for attempt in range(max_retries):
                 try:
                     resp = client.chat.completions.create(
-                        model="gpt-4o",
+                        model="gpt-4o-mini",
                         temperature=0.1,
                         top_p=0.9,
                         messages=[{"role":"system","content":sp},{"role":"user","content":up}],
@@ -483,3 +483,4 @@ if uploaded_file:
                 st.download_button("📊 Excel 리포트 다운로드", f.read(), file_name=output)
         except Exception as e:
             st.error(f"리포트 생성 오류: {e}")
+
