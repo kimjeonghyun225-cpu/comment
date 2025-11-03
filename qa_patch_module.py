@@ -107,9 +107,6 @@ def find_test_sheet_candidates(xls) -> list:
 # ==============================
 # Fail + 코멘트 추출 (라벨행→Fail열)
 # ==============================
-# ==============================
-# Fail + 코멘트 추출 (라벨행→Fail열)
-# ==============================
 def extract_comments_as_dataframe(wb, target_sheet_names):
     """
     Fail 셀과 셀 코멘트를 찾고, 해당 Fail "열(column)"에서
@@ -154,120 +151,6 @@ def extract_comments_as_dataframe(wb, target_sheet_names):
                         "OS":      str(device_info.get("OS","") or "").strip(),
                         "Rank":    str(device_info.get("Rank","") or "").strip(),
                         "Checklist": ws.title,
-                        "comment_cell": comment_text,
-                        "Comment(Text)": "",
-                    })
-    if not extracted:
-        return pd.DataFrame(columns=[
-            "Sheet","Device(Model)","GPU","Chipset","RAM","OS","Rank","Checklist","comment_cell","Comment(Text)"
-        ])
-    return pd.DataFrame(extracted)
-    # 워크북의 실제 시트명 확인
-    try:
-        available_sheets = wb.sheetnames
-    except AttributeError:
-        available_sheets = getattr(wb, 'sheet_names', [])
-    
-    for sheet_name in target_sheet_names:
-        # 시트 존재 여부 확인
-        if sheet_name not in available_sheets:
-            print(f"경고: 시트 '{sheet_name}'를 찾을 수 없습니다.")
-            continue
-        
-        try:
-            ws = wb[sheet_name]
-        except Exception as e:
-            print(f"시트 '{sheet_name}' 로드 실패: {e}")
-            continue
-        
-        # 라벨 행 찾기
-        header_rows = {
-            "Model":   find_row_by_labels(ws, ["Model","Device","제품명","제품","모델명","모델","단말","단말명","기종"]),
-            "GPU":     find_row_by_labels(ws, ["GPU","그래픽","그래픽칩","그래픽스","그래픽프로세서"]),
-            "Chipset": find_row_by_labels(ws, ["Chipset","SoC","AP","CPU","Processor","칩셋"]),
-            "RAM":     find_row_by_labels(ws, ["RAM","메모리"]),
-            "OS":      find_row_by_labels(ws, ["OS Version","Android","iOS","OS","펌웨어","소프트웨어버전"]),
-            "Rank":    find_row_by_labels(ws, ["Rating Grade?","Rank","등급"]),
-        }
-
-        # Fail 셀 찾기
-        try:
-            for row in ws.iter_rows():
-                for cell in row:
-                    val = cell.value
-                    # Fail 셀이고 코멘트가 있는 경우만 처리
-                    if (isinstance(val, str) and 
-                        val.strip().lower() == "fail" and 
-                        cell.comment):
-                        
-                        r, c = cell.row, cell.column
-                        device_info = {
-                            key: (read_merged(ws, rr, c) if rr > 0 else "")
-                            for key, rr in header_rows.items()
-                        }
-                        
-                        # Excel 안내문 제거
-                        comment_text = (cell.comment.text or "").split(
-                            "https://go.microsoft.com/fwlink/?linkid=870924.", 1
-                        )[-1].strip()
-
-                        extracted.append({
-                            "Sheet": ws.title,
-                            "Device(Model)": str(device_info.get("Model","") or "").strip(),
-                            "GPU":     str(device_info.get("GPU","") or "").strip(),
-                            "Chipset": str(device_info.get("Chipset","") or "").strip(),
-                            "RAM":     str(device_info.get("RAM","") or "").strip(),
-                            "OS":      str(device_info.get("OS","") or "").strip(),
-                            "Rank":    str(device_info.get("Rank","") or "").strip(),
-                            "Checklist": ws.title,
-                            "comment_cell": comment_text,
-                            "Comment(Text)": "",
-                        })
-        except Exception as e:
-            print(f"시트 '{sheet_name}' 처리 중 오류: {e}")
-            continue
-    
-    # 결과 반환
-    if not extracted:
-        return pd.DataFrame(columns=[
-            "Sheet","Device(Model)","GPU","Chipset","RAM","OS","Rank","Checklist","comment_cell","Comment(Text)"
-        ])
-    
-    return pd.DataFrame(extracted)
-        ws = wb[sheet_name]
-
-        header_rows = {
-            "Model":   find_row_by_labels(ws, ["Model","Device","제품명","제품","모델명","모델","단말","단말명","기종"]),
-            "GPU":     find_row_by_labels(ws, ["GPU","그래픽","그래픽칩","그래픽스","그래픽프로세서"]),
-            "Chipset": find_row_by_labels(ws, ["Chipset","SoC","AP","CPU","Processor","칩셋"]),
-            "RAM":     find_row_by_labels(ws, ["RAM","메모리"]),
-            "OS":      find_row_by_labels(ws, ["OS Version","Android","iOS","OS","펌웨어","소프트웨어버전"]),
-            "Rank":    find_row_by_labels(ws, ["Rating Grade?","Rank","등급"]),
-        }
-
-        for row in ws.iter_rows():
-            for cell in row:
-                val = cell.value
-                if isinstance(val, str) and val.strip().lower() == "fail" and cell.comment:
-                    r, c = cell.row, cell.column
-                    device_info = {
-                        key: (read_merged(ws, rr, c) if rr > 0 else "")
-                        for key, rr in header_rows.items()
-                    }
-                    # Excel 안내문 제거
-                    comment_text = (cell.comment.text or "").split(
-                        "https://go.microsoft.com/fwlink/?linkid=870924.", 1
-                    )[-1].strip()
-
-                    extracted.append({
-                        "Sheet": ws.title,
-                        "Device(Model)": str(device_info.get("Model","") or "").strip(),
-                        "GPU":     str(device_info.get("GPU","") or "").strip(),
-                        "Chipset": str(device_info.get("Chipset","") or "").strip(),
-                        "RAM":     str(device_info.get("RAM","") or "").strip(),
-                        "OS":      str(device_info.get("OS","") or "").strip(),
-                        "Rank":    str(device_info.get("Rank","") or "").strip(),
-                        "Checklist": ws.title,  # 필요 시 별도 라벨 취합 가능
                         "comment_cell": comment_text,
                         "Comment(Text)": "",
                     })
