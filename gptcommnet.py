@@ -416,8 +416,7 @@ if uploaded_file:
             sp, up, diag_budget = fit_prompt(build_user_prompt, base_kwargs)
             diag_dump("토큰 진단", diag_budget)
 
-        # 10) OpenAI 호출
-              # 🟢 수정 후: (자동 재시도 로직 및 JSON 모드 활성화)
+        # 10) OpenAI 호
         with st.spinner("GPT가 리포트를 작성 중입니다... (429 오류 시 자동 재시도)"):
             max_retries = 3
             wait_time_seconds = 20 # TPM 한도는 1분을 기다려야 할 수 있으므로, 초기 대기 시간을 넉넉하게 설정
@@ -472,4 +471,5 @@ if uploaded_file:
                 st.download_button("📊 Excel 리포트 다운로드", f.read(), file_name=output)
         except Exception as e:
             st.error(f"리포트 생성 오류: {e}")
+
 
