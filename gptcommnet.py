@@ -2,8 +2,9 @@
 
 # 최종 Streamlit 앱: QA 결과 자동 코멘트 생성기
 # - 세션 초기화 버튼 제공(프로젝트명 입력 없이 사용)
-# - Fail + 코멘트 추출 → 비고 병합(모든 선택 시트) → 스펙 병합 → GPU/CPU 군집 + Feature 군집
-# - 토큰 예산 자동 조정 → LLM(JSON 강제) → Excel 리포트
+# - Fail + 코멘트 추출(행 기반 디바이스/OS 동시 추출) → 비고 병합(모든 선택 시트) → 스펙 병합
+# - GPU/CPU(Chipset) 군집 + Feature 군집
+# - 토큰 절감(대표 샘플 압축) → gpt-4o(JSON 강제) → Excel 리포트
 
 import os
 import re
@@ -79,17 +80,54 @@ def normalize_model_name_strict(s):
     return s.lower().strip()
 
 # =========================
-# Logcat(비활성)
+# 헤더 탐지: 행 기반 디바이스/OS 추출용
 # =========================
-st.caption("※ Logcat 분석은 현재 비활성화 상태입니다.")
+def _detect_header_map(ws, max_scan_rows=12):
+    """
+    워크시트 상단에서 헤더 행을 찾고, 디바이스/OS 관련 칼럼 인덱스를 매핑.
+    반환: {"header_row": r, "device_col": c or None, "os_col": c or None}
+    """
+    header_row = None
+    device_col = None
+    os_col = None
+
+    dev_pats = [r"^(device|model|모델|모델명|제품|제품명)$"]
+    os_pats  = [r"^(os|os\s*version|android|ios|펌웨어|소프트웨어버전)$"]
+
+    def _norm_cell(v):
+        s = unicodedata.normalize("NFKC", str(v or "")).strip().lower()
+        s = re.sub(r"[\s\-\_/()\[\]{}:+·∙•]", "", s)
+        return s
+
+    for r in range(1, max_scan_rows + 1):
+        values = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)]
+        normed = [_norm_cell(v) for v in values]
+        if sum(1 for v in normed if v) < 2:
+            continue
+
+        d_idx, o_idx = None, None
+        for ci, v in enumerate(normed, start=1):
+            if v:
+                if any(re.search(p, v) for p in dev_pats) and d_idx is None:
+                    d_idx = ci
+                if any(re.search(p, v) for p in os_pats) and o_idx is None:
+                    o_idx = ci
+        if d_idx or o_idx:
+            header_row = r
+            device_col = d_idx
+            os_col = o_idx
+            break
+
+    return {"header_row": header_row, "device_col": device_col, "os_col": os_col}
 
 # =========================
 # 파일 업로드
 # =========================
+st.caption("※ Logcat 분석은 현재 비활성화 상태입니다.")
 uploaded_file = st.file_uploader("원본 QA 엑셀 파일을 업로드하세요", type=["xlsx"])
 
 if uploaded_file:
-    # 파일 포인터 문제 방지: 업로드 파일을 바이트로 고정 후 필요한 곳에서 BytesIO로 재생성
+    # 파일 포인터 고정
     data = uploaded_file.read()
 
     with step_status("엑셀 로드"):
@@ -123,28 +161,43 @@ if uploaded_file:
 
     # 실행
     if st.button("분석 및 리포트 생성", type="primary"):
-        # 실행별 상태 변수 초기화
         log_hypotheses = []
         clusters = {}
         evidence_links = []
 
-        # 3) Fail + 셀 코멘트 추출
+        # 3) Fail + 셀 코멘트 추출 (행 기반 디바이스/OS 동시 추출)
         with step_status("Fail + 셀 코멘트 추출"):
             wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
             df_issue = []
+
             for s in test_sheets_selected:
                 ws = wb[s]
+                hdr = _detect_header_map(ws, max_scan_rows=12)
+                header_row = hdr.get("header_row")
+                dev_col = hdr.get("device_col")
+                os_col  = hdr.get("os_col")
+
                 for row in ws.iter_rows():
                     for cell in row:
-                        if isinstance(cell.value, str) and cell.value.lower() == "fail" and cell.comment:
+                        if isinstance(cell.value, str) and cell.value.strip().lower() == "fail" and cell.comment:
+                            dev_val = ""
+                            os_val = ""
+                            if header_row and cell.row > header_row:
+                                if dev_col:
+                                    dev_val = ws.cell(row=cell.row, column=dev_col).value
+                                if os_col:
+                                    os_val = ws.cell(row=cell.row, column=os_col).value
+
                             df_issue.append({
                                 "Sheet": s,
                                 "Checklist": ws.title,
-                                "Device(Model)": "",  # 스펙 병합 후 채워질 수 있음
+                                "Device(Model)": str(dev_val or "").strip(),
+                                "OS": str(os_val or "").strip(),
                                 "comment_cell": (cell.comment.text or "").strip()
                             })
+
             df_issue = pd.DataFrame(df_issue) if df_issue else pd.DataFrame(
-                columns=["Sheet", "Checklist", "Device(Model)", "comment_cell"]
+                columns=["Sheet", "Checklist", "Device(Model)", "OS", "comment_cell"]
             )
             if df_issue.empty:
                 st.warning("❌ Fail+코멘트 항목이 없습니다(셀 코멘트 기준). 비고/Notes만으로도 군집화하려면 원본 시트의 비고열을 활용하십시오.")
@@ -188,7 +241,7 @@ if uploaded_file:
                             r"^(model|device|제품명|제품|모델명|모델)$": "Model",
                             r"^(maker|manufacturer|brand|oem|제조사|벤더)$": "제조사",
                             r"^(gpu|그래픽|그래픽칩|그래픽스|그래픽프로세서)$": "GPU",
-                            r"^(chipset|soc|ap|cpu)$": "Chipset",
+                            r"^(chipset|soc|ap|cpu|processor)$": "Chipset",  # processor 추가
                             r"^(ram|메모리)$": "RAM",
                             r"^(os|osversion|android|ios|펌웨어|소프트웨어버전)$": "OS",
                             r"^(rank|rating|ratinggrade|등급)$": "Rank",
@@ -219,7 +272,7 @@ if uploaded_file:
                             raise ValueError(f"'{sheet}'에서 모델 컬럼을 찾지 못했습니다. 컬럼: {list(df.columns)}")
                         df["model_norm"] = df[model_col].apply(normalize_model_name_strict)
                         cols_keep = ["model_norm"]
-                        for c in ["GPU", "제조사", "Chipset", "RAM", "OS", "Rank", "Model"]:
+                        for c in ["GPU", "제조사", "Chipset", "RAM", "OS", "Rank", "Model", "CPU"]:
                             if c in df.columns: cols_keep.append(c)
                         return df[cols_keep]
 
@@ -230,6 +283,11 @@ if uploaded_file:
                     df_final["model_norm"] = df_final["Device(Model)"].apply(normalize_model_name_strict)
                     df_final = pd.merge(df_final, df_spec_all, on="model_norm", how="left")
 
+                    # CPU → Chipset 폴백
+                    if "Chipset" not in df_final.columns and "CPU" in df_final.columns:
+                        df_final["Chipset"] = df_final["CPU"]
+
+                    # 접미사 정리
                     merge_cols = ["GPU", "제조사", "Chipset", "RAM", "OS", "Rank", "Model"]
                     for col in merge_cols:
                         cx, cy = f"{col}_x", f"{col}_y"
@@ -306,6 +364,20 @@ if uploaded_file:
 
         # 8) 군집(Cluster) 통계 산출
         with step_status("군집(Cluster) 통계 산출"):
+            # Chipset 폴백 사용
+            if "Chipset" not in df_final.columns and "CPU" in df_final.columns:
+                df_final["Chipset"] = df_final["CPU"]
+
+            # 진단: 스펙 채움 비율
+            gpu_fill = int(df_final.get("GPU", pd.Series([None]*len(df_final))).notna().sum()) if "GPU" in df_final.columns else 0
+            chip_fill = int(df_final.get("Chipset", pd.Series([None]*len(df_final))).notna().sum()) if "Chipset" in df_final.columns else 0
+            st.caption(f"🔎 GPU 채움: {gpu_fill}/{len(df_final)} · Chipset 채움: {chip_fill}/{len(df_final)}")
+
+            if "GPU" not in df_final.columns:
+                df_final["GPU"] = None
+            if "Chipset" not in df_final.columns:
+                df_final["Chipset"] = None
+
             def _cluster_counts(df, col, topn=15):
                 if col not in df.columns:
                     return pd.DataFrame(columns=[col, "count"])
@@ -322,6 +394,7 @@ if uploaded_file:
 
             cluster_gpu = _cluster_counts(df_final, "GPU")
             cluster_chip = _cluster_counts(df_final, "Chipset")
+
             clusters = {
                 "by_gpu": cluster_gpu.to_dict(orient="records"),
                 "by_chipset": cluster_chip.to_dict(orient="records"),
@@ -377,6 +450,10 @@ if uploaded_file:
             diag_dump("GPU/Chipset 군집", clusters)
             diag_dump("Feature 군집 요약", by_issue_tag)
             diag_dump("Feature 군집 상세(일부)", clusters_feature_detailed[:3])
+
+            if cluster_gpu.empty and cluster_chip.empty:
+                st.warning("GPU/Chipset 군집이 비어 있습니다. 스펙 병합 실패 가능성이 큽니다. "
+                           "→ 테스트 시트에서 디바이스명이 제대로 채워지는지와, 스펙 시트 칼럼명이 Model/Chipset/GPU로 표준화되었는지 확인하세요.")
 
         # 8.5) gpt-4o 토큰 절감: 대표 샘플만 압축 추출
         def _compact_str(s, n=160):
@@ -454,8 +531,7 @@ if uploaded_file:
             "metrics": metrics,
             "deltas": deltas,
             "evidence_links": evidence_links,
-            # 핵심: 원본 df_final 대신 압축본 투입
-            "sample_issues": compact_issues,
+            "sample_issues": compact_issues,  # 핵심: 압축본 사용
             "max_rows": 500
         }
         with step_status("토큰 예산 조정"):
