@@ -36,6 +36,17 @@ client = OpenAI(api_key=api_key)
 
 st.set_page_config(page_title="QA 결과 자동 코멘트 생성기", layout="wide")
 st.title(":bar_chart: QA 결과 자동 코멘트 생성기")
+# ▼ 프로젝트/버전 입력 UI (이 줄을 st.title 아래에 추가)
+col_pj, col_ver, col_reset = st.columns([2, 2, 1])
+with col_pj:
+    project_name = st.text_input("프로젝트명", value="", placeholder="예: AOD v1.3 CO")
+with col_ver:
+    checklist_version = st.text_input("체크리스트 버전", value="", placeholder="예: r1.2.0")
+with col_reset:
+    if st.button("🔄 세션 초기화"):
+        st.session_state.clear()
+        st.experimental_rerun()
+
 
 # =========================
 # 공통 유틸
@@ -190,6 +201,13 @@ if uploaded_file:
     st.markdown("---")
 
     if st.button("분석 및 리포트 생성", type="primary"):
+        # 🔒 실행별 상태 초기화 (이전 실행 값 섞임 방지)
+        log_summary = {}
+        log_hypotheses = []
+        clusters = {}
+        evidence_links = []
+
+
         # 3) Fail+코멘트 추출
         with step_status("Fail + 셀 코멘트 추출"):
             wb = openpyxl.load_workbook(uploaded_file, data_only=True)
@@ -268,8 +286,8 @@ if uploaded_file:
             evidence_links.append(f"Log Summary: {log_summary.get('log_summary','')}")
 
         base_kwargs = {
-            "project": "AOD v1.2 CO",
-            "version": "rX.Y",
+            "project": (project_name.strip() or "UNKNOWN_PROJECT"),
+            "version": (checklist_version.strip() or "UNKNOWN_VERSION"),
             "metrics": metrics,
             "deltas": deltas,
             "evidence_links": evidence_links,
@@ -330,3 +348,4 @@ if uploaded_file:
                 st.download_button("📊 Excel 리포트 다운로드", f.read(), file_name=output)
         except Exception as e:
             st.error(f"리포트 생성 오류: {e}")
+
