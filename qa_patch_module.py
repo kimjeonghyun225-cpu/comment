@@ -193,6 +193,7 @@ def build_system_prompt() -> str:
         "데이터 기반: 제공된 증거만 사용, 추측 금지\n"
         "metrics.log_hypotheses 가 존재하면, 각 이슈의 'cause'와 근거(evidence)에 우선 반영하십시오.\n"
         "출력은 반드시 JSON이며, 다음 스키마를 따르세요.\n"
+        "요약(summary)과 이슈 제목/본문에는 프로젝트명이나 체크리스트 버전을 포함하지 마십시오.\n"
         + JSON_SCHEMA_DOC
     )
 
