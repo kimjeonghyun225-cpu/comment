@@ -11,7 +11,6 @@ QA 통합 패치 모듈 (최종)
 import re
 import json
 from typing import List, Dict, Any, Optional
-import pandas as pd
 # === qa_patch_module.py에 추가 ===
 import pandas as pd
 import openpyxl
@@ -470,12 +469,49 @@ def write_excel_report(result: Dict[str, Any], df_final: pd.DataFrame, path: str
         else:
             pd.DataFrame().to_excel(wr, sheet_name="Evidence_Sample", index=False)
 
-        # (선택) 5) Cluster_* 시트: result.metrics.clusters 가 있으면 기록
-        metrics_in_result = result.get("metrics", {})
-        clusters = metrics_in_result.get("clusters", {}) if isinstance(metrics_in_result, dict) else {}
-        if isinstance(clusters, dict) and clusters:
-            for key, rows in clusters.items():
+        # (선택) 5) Cluster_* 시트: metrics에 따라 유연 기록
+        metrics_in_result = result.get("metrics", {}) if isinstance(result, dict) else {}
+        # ① 기존 호환: metrics["clusters"]가 dict인 경우
+        clusters_old = metrics_in_result.get("clusters", {}) if isinstance(metrics_in_result, dict) else {}
+        wrote_any = False
+        if isinstance(clusters_old, dict) and clusters_old:
+            for key, rows in clusters_old.items():
                 try:
                     pd.DataFrame(rows).to_excel(wr, sheet_name=f"Cluster_{key}", index=False)
+                    wrote_any = True
                 except Exception:
                     pass
+
+        # ② 신규 키: by_gpu_family / by_gpu / by_chipset / clusters_detailed
+        by_gpu_family = metrics_in_result.get("by_gpu_family", [])
+        by_gpu = metrics_in_result.get("by_gpu", [])
+        by_chipset = metrics_in_result.get("by_chipset", [])
+        clusters_detailed = metrics_in_result.get("clusters_detailed", [])
+
+        try:
+            if by_gpu_family:
+                pd.DataFrame(by_gpu_family).to_excel(wr, sheet_name="Cluster_by_gpu_family", index=False)
+                wrote_any = True
+        except Exception:
+            pass
+        try:
+            if by_gpu:
+                pd.DataFrame(by_gpu).to_excel(wr, sheet_name="Cluster_by_gpu", index=False)
+                wrote_any = True
+        except Exception:
+            pass
+        try:
+            if by_chipset:
+                pd.DataFrame(by_chipset).to_excel(wr, sheet_name="Cluster_by_chipset", index=False)
+                wrote_any = True
+        except Exception:
+            pass
+        try:
+            if clusters_detailed:
+                pd.DataFrame(clusters_detailed).to_excel(wr, sheet_name="Cluster_detailed", index=False)
+                wrote_any = True
+        except Exception:
+            pass
+        # wrote_any가 False여도 에러는 아님(클러스터 데이터가 없을 수 있음)
+
+
