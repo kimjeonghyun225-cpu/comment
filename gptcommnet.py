@@ -441,7 +441,7 @@ if uploaded_file:
             for attempt in range(max_retries):
                 try:
                     resp = client.chat.completions.create(
-                        model="gpt-5o",
+                        model="gpt-4o-mini",
                         temperature=0.1,
                         top_p=0.9,
                         messages=[{"role":"system","content":sp},{"role":"user","content":up}],
@@ -483,5 +483,6 @@ if uploaded_file:
                 st.download_button("📊 Excel 리포트 다운로드", f.read(), file_name=output)
         except Exception as e:
             st.error(f"리포트 생성 오류: {e}")
+
 
 
