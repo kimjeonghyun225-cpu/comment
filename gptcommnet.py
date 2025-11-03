@@ -42,9 +42,31 @@ st.set_page_config(page_title="QA 결과 자동 코멘트 생성기", layout="wi
 st.title(":bar_chart: QA 결과 자동 코멘트 생성기")
 
 # 세션 초기화 버튼만 사용 (프로젝트명 입력 UI 없음)
-if st.button("🔄 세션 초기화"):
-    st.session_state.clear()
-    st.experimental_rerun()
+# 세션 초기화 버튼
+col_pj, col_ver, col_reset = st.columns([2, 2, 1])
+with col_reset:
+    if st.button("🔄 세션 초기화"):
+        # 세션/캐시 비우기
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        try:
+            st.cache_resource.clear()
+        except Exception:
+            pass
+
+        # 버전에 따라 rerun 호출
+        if hasattr(st, "rerun"):
+            st.rerun()
+        elif hasattr(st, "experimental_rerun"):
+            st.experimental_rerun()
+        else:
+            st.write("🔁 재실행 API가 없는 Streamlit 버전입니다. 수동으로 페이지를 새로고침하세요.")
+
+
 
 # =========================
 # 공통 유틸
@@ -447,3 +469,4 @@ if uploaded_file:
                 st.download_button("📊 Excel 리포트 다운로드", f.read(), file_name=output)
         except Exception as e:
             st.error(f"리포트 생성 오류: {e}")
+
