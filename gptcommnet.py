@@ -3,12 +3,22 @@
 
 import os, re, io, time, unicodedata
 from contextlib import contextmanager
+from typing import List, Dict, Any, Optional
+
 import pandas as pd
 import openpyxl
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
-from typing import List, Dict, Any, Optional
+
+from qa_patch_module import (
+    find_test_sheet_candidates,
+    extract_comments_as_dataframe_dual,
+    enrich_with_column_comments,
+    build_system_prompt, build_user_prompt,
+    parse_llm_json, write_excel_report,
+    self_check, normalize_model_name_strict
+)
 
 # ============= 기본 설정 =============
 load_dotenv()
@@ -32,7 +42,7 @@ def step_status(title: str):
             status.update(label=f"{title} - 실패: {e}", state="error", expanded=True)
             raise
 
-def diag_dump(label: str, obj): 
+def diag_dump(label: str, obj):
     with st.expander(f"🔎 진단 보기: {label}", expanded=False):
         st.write(obj)
 
@@ -50,10 +60,6 @@ if not uploaded_file:
 # ============= 엑셀 로드 & 시트 선택 =============
 data = uploaded_file.read()
 with step_status("엑셀 로드"):
-    xls = pd.ExcelFile(io.BytesIO(data), engine="openpyxl")
-    diag_dump("시트 목록", xls.sheet_names)
-
-with step_status("엑셀 로드"):
     try:
         xls = pd.ExcelFile(io.BytesIO(data), engine="openpyxl")
         diag_dump("시트 목록", xls.sheet_names)
@@ -63,22 +69,12 @@ with step_status("엑셀 로드"):
 
 with step_status("테스트 시트 자동감지"):
     try:
-        # xls 객체가 제대로 생성되었는지 확인
-        if not hasattr(xls, 'sheet_names') or xls.sheet_names is None:
-            st.error("엑셀 파일에서 시트 정보를 읽을 수 없습니다.")
-            st.stop()
-        
         test_candidates = find_test_sheet_candidates(xls)
-        
-        # 결과가 비어있으면 모든 시트 사용
         if not test_candidates:
             test_candidates = xls.sheet_names
-            
         diag_dump("감지된 후보 시트", test_candidates)
     except Exception as e:
         st.error(f"테스트 시트 감지 오류: {e}")
-        st.write("전체 시트 목록:", xls.sheet_names)
-        # 에러 발생 시 모든 시트를 후보로 사용
         test_candidates = xls.sheet_names if hasattr(xls, 'sheet_names') else []
 
 st.subheader("1. 테스트 시트 선택")
@@ -106,38 +102,28 @@ if not st.button("분석 및 리포트 생성", type="primary"):
 
 log_hypotheses, clusters, evidence_links = [], {}, []
 
-# 3) Fail + 코멘트 추출 (라벨행→Fail열 세로추출, 병합셀 보정)
-# 3) Fail + 코멘트 추출 (라벨행→Fail열 세로추출, 병합셀 보정)
+# 3) Fail + 코멘트 추출 (라벨행→Fail열 세로추출, 병합셀 보정, 수식/스레드댓글 대응)
 with step_status("Fail + 셀 코멘트 추출"):
     try:
-        # data_only=False로 변경 (코멘트 읽기 위해)
-        wb = openpyxl.load_workbook(io.BytesIO(data), data_only=False)
-        
-        # 선택된 시트가 워크북에 있는지 확인
-        available_sheets = wb.sheetnames
-        valid_sheets = [s for s in test_sheets_selected if s in available_sheets]
-        
+        # 코멘트용/값용 워크북 분리
+        wb_comm = openpyxl.load_workbook(io.BytesIO(data), data_only=False)
+        wb_val  = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
+
+        available = set(wb_comm.sheetnames) & set(wb_val.sheetnames)
+        valid_sheets = [s for s in test_sheets_selected if s in available]
         if not valid_sheets:
-            st.error(f"선택한 시트를 찾을 수 없습니다. 사용 가능한 시트: {available_sheets}")
+            st.error(f"선택한 시트를 찾을 수 없습니다. 사용 가능: {sorted(list(available))}")
             st.stop()
-        
-        df_issue = extract_comments_as_dataframe(wb, valid_sheets)
+
+        df_issue = extract_comments_as_dataframe_dual(wb_comm, wb_val, valid_sheets)
         diag_dump("추출 샘플", df_issue.head(12))
-        
+
         if df_issue.empty:
             st.warning("❌ Fail+코멘트 항목이 없습니다(셀 코멘트 기준).")
-            st.info("💡 팁: Excel에서 Fail 셀에 마우스 우클릭 → '메모 삽입'으로 코멘트를 추가했는지 확인하세요.")
+            st.info("💡 팁: Fail 셀에 실제 코멘트(메모) 또는 비고/Notes를 활용하세요.")
             st.stop()
-            
     except Exception as e:
         st.error(f"코멘트 추출 중 오류: {str(e)}")
-        st.write("선택된 시트:", test_sheets_selected)
-        if 'wb' in locals():
-            st.write("워크북의 실제 시트:", wb.sheetnames)
-        st.stop()
-    diag_dump("추출 샘플", df_issue.head(12))
-    if df_issue.empty:
-        st.warning("❌ Fail+코멘트 항목이 없습니다(셀 코멘트 기준).")
         st.stop()
 
 # 4) 비고/Notes 병합 (선택 시트 전부)
@@ -156,12 +142,12 @@ if spec_sheets_selected:
             norm = [unicodedata.normalize("NFKC", str(c)) for c in orig]
             norm = [re.sub(r"[\s\-\_/()\[\]{}:+·∙•]", "", s).lower() for s in norm]
             synonyms = {
-                r"^(model|device|제품명|제품|모델명|모델)$": "Model",
+                r"^(model|device|제품명|제품|모델명|모델|단말|단말명|기종)$": "Model",
                 r"^(maker|manufacturer|brand|oem|제조사|벤더)$": "제조사",
-                r"^(gpu|그래픽|그래픽칩|그래픽스|그래픽프로세서)$": "GPU",
+                r"^(gpu|그래픽|그래픽칩|그래픽스|그래픽프로세서|gpu모델|gpu명)$": "GPU",
                 r"^(chipset|soc|ap|cpu|processor)$": "Chipset",
                 r"^(ram|메모리)$": "RAM",
-                r"^(os|osversion|android|ios|펌웨어|소프트웨어버전)$": "OS",
+                r"^(os|osversion|android|ios|펌웨어|소프트웨어버전|운영체제|os버전)$": "OS",
                 r"^(rank|rating|ratinggrade|등급)$": "Rank",
             }
             col_map = {}
@@ -175,13 +161,16 @@ if spec_sheets_selected:
 
         frames = []
         for sname in spec_sheets_selected:
-            dfp = pd.read_excel(xls, sheet_name=sname, engine="openpyxl")
+            try:
+                dfp = pd.read_excel(xls, sheet_name=sname, engine="openpyxl")
+            except Exception:
+                continue
             dfp = _stdcols(dfp)
             model_col = "Model" if "Model" in dfp.columns else None
             if not model_col:
                 for c in dfp.columns:
                     n = re.sub(r"[\s\-\_/()\[\]{}:+·∙•]", "", unicodedata.normalize("NFKC", str(c))).lower()
-                    if re.search(r"^(model|device|제품명|제품|모델명|모델)$", n): model_col = c; break
+                    if re.search(r"^(model|device|제품명|제품|모델명|모델|단말|단말명|기종)$", n): model_col = c; break
             if not model_col:
                 continue
             dfp["model_norm"] = dfp[model_col].apply(normalize_model_name_strict)
@@ -190,6 +179,7 @@ if spec_sheets_selected:
 
         if frames:
             df_spec_all = pd.concat(frames, ignore_index=True).drop_duplicates("model_norm", keep="first")
+
             df_final["model_norm"] = df_final["Device(Model)"].apply(normalize_model_name_strict)
             df_final = pd.merge(df_final, df_spec_all, on="model_norm", how="left")
 
@@ -281,7 +271,9 @@ with step_status("군집(Cluster) 통계 산출"):
 
     def _cluster_counts(df, col, topn=15):
         if col not in df.columns: return pd.DataFrame(columns=[col,"count"])
-        vc = df[col].fillna("(미기재)").astype(str).str.strip().value_counts().head(topn)
+        s = df[col].astype(object)
+        s = s.where(s.notna(), "(미기재)")
+        vc = s.astype(str).str.strip().replace({"nan":"(미기재)","None":"(미기재)"}).value_counts().head(topn)
         return vc.reset_index().rename(columns={"index":col, 0:"count"})
 
     cluster_gpu  = _cluster_counts(df_final, "GPU")
@@ -392,14 +384,14 @@ up = build_user_prompt(
     max_rows=500
 )
 
-# 10) OpenAI 호출
+# 10) OpenAI 호출 (필요 시 모델만 교체: gpt-4o-mini)
 with st.spinner("GPT가 리포트를 작성 중입니다..."):
     max_retries, wait = 3, 20
     result, last_error = None, None
     for attempt in range(max_retries):
         try:
             resp = client.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-4o",          # 품질 우선 (필요 시 "gpt-4o-mini"로 변경)
                 temperature=0.1,
                 top_p=0.9,
                 messages=[{"role":"system","content":sp},{"role":"user","content":up}],
@@ -431,6 +423,3 @@ try:
         st.download_button("📊 Excel 리포트 다운로드", f.read(), file_name=output)
 except Exception as e:
     st.error(f"리포트 생성 오류: {e}")
-
-
-
