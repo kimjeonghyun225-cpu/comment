@@ -2,13 +2,12 @@
 
 # 최종 Streamlit 앱: QA 결과 자동 코멘트 생성기
 # - 세션 초기화 버튼 제공(프로젝트명 입력 없이 사용)
-# - Fail + 코멘트 추출 → 비고 병합(모든 선택 시트) → 스펙 병합 → GPU/CPU 군집 + Feature(펀치홀/노치/회전/설치/권한/입력지연 등) 군집
+# - Fail + 코멘트 추출 → 비고 병합(모든 선택 시트) → 스펙 병합 → GPU/CPU 군집 + Feature 군집
 # - 토큰 예산 자동 조정 → LLM(JSON 강제) → Excel 리포트
 
 import os
 import re
 import io
-import zipfile
 import unicodedata
 import time
 from contextlib import contextmanager
@@ -82,7 +81,6 @@ def normalize_model_name_strict(s):
 # =========================
 # Logcat(비활성)
 # =========================
-log_files = None
 st.caption("※ Logcat 분석은 현재 비활성화 상태입니다.")
 
 # =========================
@@ -126,12 +124,11 @@ if uploaded_file:
     # 실행
     if st.button("분석 및 리포트 생성", type="primary"):
         # 실행별 상태 변수 초기화
-        log_summary = {}
         log_hypotheses = []
         clusters = {}
         evidence_links = []
 
-        # 3) Fail + 셀 코멘트 추출 (셀 코멘트가 없으면 비고 통합만으로 진행)
+        # 3) Fail + 셀 코멘트 추출
         with step_status("Fail + 셀 코멘트 추출"):
             wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
             df_issue = []
@@ -165,7 +162,6 @@ if uploaded_file:
         if spec_sheets_selected:
             with step_status("스펙 병합"):
                 try:
-                    # 스펙 헤더 자동탐지 + 표준화
                     def _norm_for_header(s: str) -> str:
                         s = unicodedata.normalize("NFKC", str(s))
                         s = re.sub(r"[\s\-\_/()\[\]{}:+·∙•]", "", s)
@@ -234,7 +230,6 @@ if uploaded_file:
                     df_final["model_norm"] = df_final["Device(Model)"].apply(normalize_model_name_strict)
                     df_final = pd.merge(df_final, df_spec_all, on="model_norm", how="left")
 
-                    # 접미사 정리
                     merge_cols = ["GPU", "제조사", "Chipset", "RAM", "OS", "Rank", "Model"]
                     for col in merge_cols:
                         cx, cy = f"{col}_x", f"{col}_y"
@@ -261,7 +256,7 @@ if uploaded_file:
                 st.error("❌ 유효한 데이터 없음. 중단.")
                 st.stop()
 
-        # 7) 코멘트 정규화 및 Feature 태깅 (df_final 생성 이후)
+        # 7) 코멘트 정규화 / 태깅
         with step_status("코멘트 정규화 / 태깅"):
             def _jamo_norm(s: str) -> str:
                 if s is None: return ""
@@ -309,7 +304,7 @@ if uploaded_file:
             df_final["issue_tags"]   = df_final["comment_text"].fillna("").astype(str).apply(tag_issue_comment)
             diag_dump("태깅 샘플", df_final[["Device(Model)","GPU","Chipset","OS","comment_text","issue_tags"]].head(15))
 
-        # 8) GPU/Chipset 군집 + Feature 군집
+        # 8) 군집(Cluster) 통계 산출
         with step_status("군집(Cluster) 통계 산출"):
             def _cluster_counts(df, col, topn=15):
                 if col not in df.columns:
@@ -317,7 +312,6 @@ if uploaded_file:
                 vc = df[col].fillna("(미기재)").astype(str).str.strip().value_counts().head(topn)
                 return vc.reset_index().rename(columns={"index": col, 0: "count"})
 
-            # GPU 이름 보정(계열 통합 예)
             if "GPU" in df_final.columns:
                 df_final["GPU"] = (
                     df_final["GPU"].astype(str)
@@ -384,6 +378,42 @@ if uploaded_file:
             diag_dump("Feature 군집 요약", by_issue_tag)
             diag_dump("Feature 군집 상세(일부)", clusters_feature_detailed[:3])
 
+        # 8.5) gpt-4o 토큰 절감: 대표 샘플만 압축 추출
+        def _compact_str(s, n=160):
+            s = (str(s or "")).strip()
+            return (s[:n] + "…") if len(s) > n else s
+
+        def make_compact_sample(df: pd.DataFrame, per_tag=30, per_gpu=20, per_chip=20, max_rows=450):
+            keep = [c for c in ["Sheet","Device(Model)","GPU","Chipset","OS","comment_text","issue_tags"] if c in df.columns]
+            slim = df[keep].copy()
+            slim["comment_text"] = slim["comment_text"].map(lambda x: _compact_str(x, 180))
+            slim["__dedup_key__"] = (
+                slim["Device(Model)"].astype(str).str.strip().str.lower()
+                + "||" + slim["comment_text"].astype(str).str.strip().str.lower()
+            )
+            slim = slim.drop_duplicates("__dedup_key__")
+
+            out = []
+            if "issue_tags" in slim.columns:
+                tag_order = ["crash","black_screen","white_screen","render_artifact","rotation",
+                             "aspect_ratio","ui_scaling","resolution","permission","install",
+                             "input_lag","fps","thermal","network","audio","camera","notch","punch_hole"]
+                for t in tag_order:
+                    sub = slim[slim["issue_tags"].astype(str).str.contains(t, regex=False, na=False)].head(per_tag)
+                    out.append(sub)
+            if "GPU" in slim.columns:
+                for g in slim["GPU"].fillna("(미기재)").value_counts().head(10).index.tolist():
+                    out.append(slim[slim["GPU"] == g].head(per_gpu))
+            if "Chipset" in slim.columns:
+                for c in slim["Chipset"].fillna("(미기재)").value_counts().head(10).index.tolist():
+                    out.append(slim[slim["Chipset"] == c].head(per_chip))
+
+            compact = pd.concat(out, ignore_index=True).drop_duplicates("__dedup_key__")
+            compact = compact.head(max_rows).drop(columns=["__dedup_key__"], errors="ignore")
+            return compact
+
+        compact_issues = make_compact_sample(df_final, per_tag=30, per_gpu=20, per_chip=20, max_rows=450)
+
         # 9) 프롬프트 준비 + 토큰 예산 조정
         metrics = {
             "total_fail_issues": len(df_final),
@@ -405,7 +435,7 @@ if uploaded_file:
             except Exception:
                 return sum(_rough_token_count(m.get("content","")) for m in msgs)
 
-        def fit_prompt(build_user, base_kwargs, model_budget=200000, reserve_output=6000):
+        def fit_prompt(build_user, base_kwargs, model_budget=30000, reserve_output=6000):
             max_rows_list = [800, 600, 400, 300, 200, 100]
             df = base_kwargs["sample_issues"]
             for mr in max_rows_list:
@@ -424,24 +454,25 @@ if uploaded_file:
             "metrics": metrics,
             "deltas": deltas,
             "evidence_links": evidence_links,
-            "sample_issues": df_final,
+            # 핵심: 원본 df_final 대신 압축본 투입
+            "sample_issues": compact_issues,
             "max_rows": 500
         }
         with step_status("토큰 예산 조정"):
             sp, up, diag_budget = fit_prompt(build_user_prompt, base_kwargs)
             diag_dump("토큰 진단", diag_budget)
 
-        # 10) OpenAI 호출 (버튼 클릭 블록 내부 유지)
+        # 10) OpenAI 호출
         with st.spinner("GPT가 리포트를 작성 중입니다... (429 오류 시 자동 재시도)"):
             max_retries = 3
-            wait_time_seconds = 20  # 초기 대기 넉넉히
+            wait_time_seconds = 20
             last_error = None
             result = None
 
             for attempt in range(max_retries):
                 try:
                     resp = client.chat.completions.create(
-                        model="gpt-4o-mini",
+                        model="gpt-4o",
                         temperature=0.1,
                         top_p=0.9,
                         messages=[{"role":"system","content":sp},{"role":"user","content":up}],
@@ -449,7 +480,7 @@ if uploaded_file:
                     )
                     raw = resp.choices[0].message.content
                     result = parse_llm_json(raw)
-                    result["metrics"] = metrics  # 군집/태그 근거 보존
+                    result["metrics"] = metrics
                     diag_dump("LLM 원문(요약)", raw[:4000])
                     last_error = None
                     break
@@ -462,7 +493,7 @@ if uploaded_file:
                         if attempt < max_retries - 1:
                             st.warning(f"⏳ RATE LIMIT (429) 감지 (시도 {attempt + 1}/{max_retries}). {wait_time_seconds}초 후 재시도합니다.")
                             time.sleep(wait_time_seconds)
-                            wait_time_seconds *= 2  # Exponential Backoff
+                            wait_time_seconds *= 2
                         else:
                             st.error(f"❌ RATE LIMIT (429) 오류. 재시도({max_retries}회) 모두 실패.")
                             st.stop()
@@ -483,6 +514,3 @@ if uploaded_file:
                 st.download_button("📊 Excel 리포트 다운로드", f.read(), file_name=output)
         except Exception as e:
             st.error(f"리포트 생성 오류: {e}")
-
-
-
