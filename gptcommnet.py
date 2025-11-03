@@ -8,15 +8,7 @@ import openpyxl
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
-
-from qa_patch_module import (
-    find_test_sheet_candidates,
-    extract_comments_as_dataframe,          # ⬅︎ 이번 핵심
-    enrich_with_column_comments,
-    build_system_prompt, build_user_prompt,
-    parse_llm_json, write_excel_report,
-    self_check, normalize_model_name_strict
-)
+from typing import List, Dict, Any, Optional
 
 # ============= 기본 설정 =============
 load_dotenv()
@@ -390,3 +382,4 @@ try:
         st.download_button("📊 Excel 리포트 다운로드", f.read(), file_name=output)
 except Exception as e:
     st.error(f"리포트 생성 오류: {e}")
+
