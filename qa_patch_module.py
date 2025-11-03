@@ -12,6 +12,141 @@ import re
 import json
 from typing import List, Dict, Any, Optional
 import pandas as pd
+# === qa_patch_module.py에 추가 ===
+import pandas as pd
+import openpyxl
+import unicodedata
+
+def _norm_for_header(s: str) -> str:
+    s = unicodedata.normalize("NFKC", str(s))
+    s = re.sub(r"[\s\-\_/()\[\]{}:+·∙•]", "", s)
+    return s.lower().strip()
+
+def find_row_by_labels(ws, labels, search_rows=30, search_cols=70):
+    max_r = min(search_rows, ws.max_row)
+    max_c = min(search_cols, ws.max_column)
+    target = set(str(x).strip() for x in labels)
+    for r in range(1, max_r + 1):
+        for c in range(1, max_c + 1):
+            v = ws.cell(row=r, column=c).value
+            if v and str(v).strip() in target:
+                return r
+    return 0
+
+def get_checklist_label(ws, row):
+    label_parts, columns_to_check = [], [6, 7, 9]
+    for c in columns_to_check:
+        for r_search in range(row, 0, -1):
+            cell_value = ws.cell(row=r_search, column=c).value
+            if cell_value and str(cell_value).strip():
+                label_parts.append(str(cell_value).replace("\n", " ").strip())
+                break
+    return " / ".join(label_parts)
+
+def extract_comments_as_dataframe(wb, target_sheet_names):
+    """Fail 셀 + 셀 코멘트를 찾아 모델/칩셋/OS 등 메타까지 묶어 DataFrame으로 반환."""
+    extracted = []
+    for sheet_name in target_sheet_names:
+        if sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+        header_rows = {
+            "Model":   find_row_by_labels(ws, ["Model", "제품명"]),
+            "Chipset": find_row_by_labels(ws, ["Chipset", "CPU", "AP"]),
+            "RAM":     find_row_by_labels(ws, ["RAM", "메모리"]),
+            "Rank":    find_row_by_labels(ws, ["Rating Grade?", "Rank", "등급"]),
+            "OS":      find_row_by_labels(ws, ["OS Version", "Android", "iOS", "OS"]),
+        }
+        for row in ws.iter_rows():
+            for cell in row:
+                val = cell.value
+                if isinstance(val, str) and val.strip().lower() == "fail" and cell.comment:
+                    r, c = cell.row, cell.column
+                    device_info = {
+                        key: ws.cell(row=num, column=c).value if num > 0 else ""
+                        for key, num in header_rows.items()
+                    }
+                    checklist = get_checklist_label(ws, r)
+                    comment_text = (cell.comment.text or "").split(
+                        "https://go.microsoft.com/fwlink/?linkid=870924.", 1
+                    )[-1].strip()
+                    extracted.append({
+                        "Sheet": ws.title,
+                        "Device(Model)": device_info.get("Model", ""),
+                        "Chipset": device_info.get("Chipset", ""),
+                        "RAM": device_info.get("RAM", ""),
+                        "Rank": device_info.get("Rank", ""),
+                        "OS": device_info.get("OS", ""),
+                        "Checklist": checklist,
+                        "comment_cell": comment_text,
+                        "Comment(Text)": "",
+                    })
+    if not extracted:
+        return None
+    return pd.DataFrame(extracted)
+
+def load_std_spec_df(xls, sheet):
+    """스펙 시트의 헤더 자동탐지 → 표준 컬럼명 매핑 → model_norm 생성."""
+    # 헤더 탐지
+    df_probe = pd.read_excel(xls, sheet_name=sheet, header=None, engine="openpyxl")
+    header_row_idx = 0
+    header_candidates = [r"^model$", r"^device$", r"^제품명$", r"^제품$", r"^모델명$", r"^모델$"]
+    for r in range(min(12, len(df_probe))):
+        row_vals = df_probe.iloc[r].astype(str).fillna("")
+        norm_vals = [_norm_for_header(v) for v in row_vals]
+        for v in norm_vals:
+            if any(re.search(pat, v) for pat in header_candidates):
+                header_row_idx = r; break
+        if header_row_idx:
+            break
+
+    df = pd.read_excel(xls, sheet_name=sheet, header=header_row_idx, engine="openpyxl")
+    # 표준화
+    original_cols = list(df.columns)
+    norm_cols = [_norm_for_header(c) for c in original_cols]
+    synonyms = {
+        r"^(model|device|제품명|제품|모델명|모델)$": "Model",
+        r"^(maker|manufacturer|brand|oem|제조사|벤더)$": "제조사",
+        r"^(gpu|그래픽|그래픽칩|그래픽스|그래픽프로세서)$": "GPU",
+        r"^(chipset|soc|ap|cpu)$": "Chipset",
+        r"^(ram|메모리)$": "RAM",
+        r"^(os|osversion|android|ios|펌웨어|소프트웨어버전)$": "OS",
+        r"^(rank|rating|ratinggrade|등급)$": "Rank",
+    }
+    col_map = {}
+    for norm_name, orig_name in zip(norm_cols, original_cols):
+        mapped = None
+        for pat, std_name in synonyms.items():
+            if re.search(pat, norm_name):
+                mapped = std_name; break
+        col_map[orig_name] = mapped or orig_name
+    df = df.rename(columns=col_map)
+
+    # model_norm
+    def normalize_model_name_strict(s):
+        if pd.isna(s): return ""
+        s = str(s)
+        s = re.sub(r"\(.*?\)", "", s)
+        s = re.sub(r"\b(64|128|256|512)\s*gb\b", "", s, flags=re.I)
+        s = re.sub(r"\b(black|white|blue|red|green|gold|silver|골드|블랙|화이트|실버)\b", "", s, flags=re.I)
+        s = re.sub(r"[\s\-_]+", "", s)
+        return s.lower().strip()
+
+    model_col = "Model" if "Model" in df.columns else None
+    if model_col is None:
+        for c in df.columns:
+            if re.search(r"^(model|device|제품명|제품|모델명|모델)$", _norm_for_header(c)):
+                model_col = c; break
+    if model_col is None:
+        raise ValueError(f"'{sheet}'에서 모델 컬럼을 찾지 못했습니다. 컬럼: {list(df.columns)}")
+
+    df["model_norm"] = df[model_col].apply(normalize_model_name_strict)
+    cols_keep = ["model_norm"]
+    for c in ["GPU","제조사","Chipset","RAM","OS","Rank","Model"]:
+        if c in df.columns:
+            cols_keep.append(c)
+    return df[cols_keep]
+
 
 # ==============================
 # 테스트 시트 자동 감지
