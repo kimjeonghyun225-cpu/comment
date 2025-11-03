@@ -2,7 +2,7 @@
 """
 QA 통합 패치 모듈 (최종)
 - 테스트 시트 자동 감지
-- Fail 셀 + 코멘트 추출 (라벨행→Fail열 세로추출, 병합셀 보정)
+- Fail 셀 + 코멘트 추출 (라벨행→Fail열 세로추출, 병합셀 보정, 수식/스레드댓글 대응)
 - 셀 코멘트 + 비고/Notes 병합
 - LLM JSON 강제(A~E 스펙, issues[] 제한 없음)
 - Excel 리포트(Executive_Summary / Summary / Issues / Device_Risks / Evidence_Sample / Cluster_*)
@@ -47,6 +47,8 @@ def normalize_model_name_strict(s):
     s = re.sub(r"\(.*?\)", "", s)
     s = re.sub(r"\b(64|128|256|512)\s*gb\b", "", s, flags=re.I)
     s = re.sub(r"\b(black|white|blue|red|green|gold|silver|골드|블랙|화이트|실버)\b", "", s, flags=re.I)
+    # 통신사/판매구분/부가표기 제거(필요 시 추가)
+    s = re.sub(r"\b(kt|skt|lg\s*u\+|자급제|공기계|dual\s*sim|5g|4g)\b", "", s, flags=re.I)
     s = re.sub(r"[\s\-_]+", "", s)
     return s.lower().strip()
 
@@ -54,14 +56,14 @@ def normalize_model_name_strict(s):
 # 병합셀 안전 읽기 + 라벨행 탐지
 # ==============================
 def read_merged(ws, r, c):
-    """병합 셀을 고려해서 (r,c)의 실제 값을 안전하게 읽는다."""
+    """병합 셀을 고려하여 (r,c) 값 안전 읽기"""
     for rng in ws.merged_cells.ranges:
         if (rng.min_row <= r <= rng.max_row) and (rng.min_col <= c <= rng.max_col):
             return ws.cell(row=rng.min_row, column=rng.min_col).value
     return ws.cell(row=r, column=c).value
 
 def find_row_by_labels(ws, labels, search_rows=30, search_cols=80) -> int:
-    labels_norm = { _norm_for_header(x) for x in labels }
+    labels_norm = {_norm_for_header(x) for x in labels}
     max_r = min(search_rows, ws.max_row)
     max_c = min(search_cols, ws.max_column)
     for r in range(1, max_r + 1):
@@ -105,55 +107,65 @@ def find_test_sheet_candidates(xls) -> list:
     return sorted(cands) if cands else names
 
 # ==============================
-# Fail + 코멘트 추출 (라벨행→Fail열)
+# Fail + 코멘트 추출 (라벨행→Fail열, 듀얼 워크북)
 # ==============================
-def extract_comments_as_dataframe(wb, target_sheet_names):
+def extract_comments_as_dataframe_dual(wb_comments, wb_values, target_sheet_names):
     """
-    Fail 셀과 셀 코멘트를 찾고, 해당 Fail "열(column)"에서
-    Model/GPU/Chipset/RAM/OS/Rank 값을 라벨행 기준으로 수직 추출.
-    병합셀도 보정하여 정확도 확보.
+    Fail 셀 + 코멘트는 wb_comments(data_only=False)에서,
+    해당 열의 Model/GPU/Chipset/OS/Rank는 wb_values(data_only=True)에서 읽는다.
     """
     extracted = []
     for sheet_name in target_sheet_names:
-        if sheet_name not in wb.sheetnames:
+        if sheet_name not in wb_comments.sheetnames or sheet_name not in wb_values.sheetnames:
             continue
-        ws = wb[sheet_name]
+        ws_c = wb_comments[sheet_name]  # 코멘트/Fail 탐지
+        ws_v = wb_values[sheet_name]    # 수식 평가 값
 
         header_rows = {
-            "Model":   find_row_by_labels(ws, ["Model","Device","제품명","제품","모델명","모델","단말","단말명","기종"]),
-            "GPU":     find_row_by_labels(ws, ["GPU","그래픽","그래픽칩","그래픽스","그래픽프로세서"]),
-            "Chipset": find_row_by_labels(ws, ["Chipset","SoC","AP","CPU","Processor","칩셋"]),
-            "RAM":     find_row_by_labels(ws, ["RAM","메모리"]),
-            "OS":      find_row_by_labels(ws, ["OS Version","Android","iOS","OS","펌웨어","소프트웨어버전"]),
-            "Rank":    find_row_by_labels(ws, ["Rating Grade?","Rank","등급"]),
+            "Model":   find_row_by_labels(ws_c, ["Model","Device","제품명","제품","모델명","모델","단말","단말명","기종"]),
+            "GPU":     find_row_by_labels(ws_c, ["GPU","그래픽","그래픽칩","그래픽스","그래픽프로세서"]),
+            "Chipset": find_row_by_labels(ws_c, ["Chipset","SoC","AP","CPU","Processor","칩셋"]),
+            "RAM":     find_row_by_labels(ws_c, ["RAM","메모리"]),
+            "OS":      find_row_by_labels(ws_c, ["OS Version","Android","iOS","OS","펌웨어","소프트웨어버전"]),
+            "Rank":    find_row_by_labels(ws_c, ["Rating Grade?","Rank","등급"]),
         }
 
-        for row in ws.iter_rows():
+        def _get_val(rr, cc):
+            if rr <= 0: return ""
+            v = read_merged(ws_v, rr, cc)
+            if isinstance(v, (int, float)):
+                v = str(int(v)) if isinstance(v, float) and v.is_integer() else str(v)
+            if isinstance(v, str) and v.startswith("="):
+                return ""
+            return (v or "").strip()
+
+        for row in ws_c.iter_rows():
             for cell in row:
                 val = cell.value
                 if isinstance(val, str) and val.strip().lower() == "fail" and cell.comment:
                     r, c = cell.row, cell.column
-                    device_info = {
-                        key: (read_merged(ws, rr, c) if rr > 0 else "")
-                        for key, rr in header_rows.items()
-                    }
-                    # Excel 안내문 제거
-                    comment_text = (cell.comment.text or "").split(
-                        "https://go.microsoft.com/fwlink/?linkid=870924.", 1
-                    )[-1].strip()
+
+                    # 값은 data_only=True 워크북에서 읽는다
+                    device_info = { key: _get_val(rr, c) for key, rr in header_rows.items() }
+
+                    # 스레드 댓글 안내문 제거
+                    ctext = (cell.comment.text or "").strip()
+                    if ctext.startswith("[스레드 댓글]"):
+                        ctext = ""
 
                     extracted.append({
-                        "Sheet": ws.title,
-                        "Device(Model)": str(device_info.get("Model","") or "").strip(),
-                        "GPU":     str(device_info.get("GPU","") or "").strip(),
-                        "Chipset": str(device_info.get("Chipset","") or "").strip(),
-                        "RAM":     str(device_info.get("RAM","") or "").strip(),
-                        "OS":      str(device_info.get("OS","") or "").strip(),
-                        "Rank":    str(device_info.get("Rank","") or "").strip(),
-                        "Checklist": ws.title,
-                        "comment_cell": comment_text,
+                        "Sheet": ws_c.title,
+                        "Device(Model)": device_info.get("Model",""),
+                        "GPU":     device_info.get("GPU",""),
+                        "Chipset": device_info.get("Chipset",""),
+                        "RAM":     device_info.get("RAM",""),
+                        "OS":      device_info.get("OS",""),
+                        "Rank":    device_info.get("Rank",""),
+                        "Checklist": ws_c.title,
+                        "comment_cell": ctext,
                         "Comment(Text)": "",
                     })
+
     if not extracted:
         return pd.DataFrame(columns=[
             "Sheet","Device(Model)","GPU","Chipset","RAM","OS","Rank","Checklist","comment_cell","Comment(Text)"
@@ -250,7 +262,7 @@ def self_check(df_issues: pd.DataFrame) -> Dict[str, Any]:
     }
 
 # ==============================
-# LLM JSON 강제 (A~E 스펙, issues[] 제한 없음)
+# LLM JSON 강제
 # ==============================
 JSON_SCHEMA_DOC = r"""
 반드시 JSON만 출력. JSON 이외의 문자를 포함하지 말 것.
@@ -325,9 +337,9 @@ def parse_llm_json(text: str) -> Dict[str, Any]:
     obj.setdefault("actions", [])
     return obj
 
-# ------------------------------
+# ==============================
 # Summary 상세 블록 빌더
-# ------------------------------
+# ==============================
 _DEVICE_PAT = re.compile(r"(Galaxy\s?[A-Z0-9\-]+|SM\-[A-Z0-9]+|iPhone\s?[A-Z0-9\-+ ]+|Pixel\s?\d+(?:\sPro)?|Redmi\s?[A-Z0-9\-]+|Xiaomi\s?[A-Z0-9\-]+|OPPO\s?[A-Z0-9\-]+|VIVO\s?[A-Z0-9\-]+)", re.I)
 
 def _pick_devices_from_evidence(evidence_list, fallback_models=None, topn=3):
