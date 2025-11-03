@@ -8,9 +8,12 @@ QA 통합 패치 모듈 (최종)
 - Excel 리포트(Executive_Summary / Summary / Issues / Device_Risks / Evidence_Sample / Cluster_*)
 - 모듈 자가진단(self_check)
 """
+import io
 import re
 import json
+import zipfile
 import unicodedata
+import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Optional
 import pandas as pd
 import openpyxl
@@ -47,8 +50,6 @@ def normalize_model_name_strict(s):
     s = re.sub(r"\(.*?\)", "", s)
     s = re.sub(r"\b(64|128|256|512)\s*gb\b", "", s, flags=re.I)
     s = re.sub(r"\b(black|white|blue|red|green|gold|silver|골드|블랙|화이트|실버)\b", "", s, flags=re.I)
-    # 통신사/판매구분/부가표기 제거(필요 시 추가)
-    s = re.sub(r"\b(kt|skt|lg\s*u\+|자급제|공기계|dual\s*sim|5g|4g)\b", "", s, flags=re.I)
     s = re.sub(r"[\s\-_]+", "", s)
     return s.lower().strip()
 
@@ -56,7 +57,7 @@ def normalize_model_name_strict(s):
 # 병합셀 안전 읽기 + 라벨행 탐지
 # ==============================
 def read_merged(ws, r, c):
-    """병합 셀을 고려하여 (r,c) 값 안전 읽기"""
+    """병합 셀을 고려해서 (r,c)의 실제 값을 안전하게 읽는다."""
     for rng in ws.merged_cells.ranges:
         if (rng.min_row <= r <= rng.max_row) and (rng.min_col <= c <= rng.max_col):
             return ws.cell(row=rng.min_row, column=rng.min_col).value
@@ -107,19 +108,117 @@ def find_test_sheet_candidates(xls) -> list:
     return sorted(cands) if cands else names
 
 # ==============================
-# Fail + 코멘트 추출 (라벨행→Fail열, 듀얼 워크북)
+# 스레드 댓글(threadedComments) 파싱
 # ==============================
-def extract_comments_as_dataframe_dual(wb_comments, wb_values, target_sheet_names):
+def _sanitize_excel_comment(text: str) -> str:
+    """Excel 스레드 댓글/안내문 머리말을 제거하고 사용자 본문만 남긴다."""
+    s = str(text or "")
+    lines = [ln for ln in s.splitlines()]
+    if lines:
+        if re.match(r"^\s*\[?\s*스레드\s*댓글[^\]]*\]?\s*$", lines[0], flags=re.I):
+            lines = lines[1:]
+        elif re.match(r"^\s*this\s+cell\s+contains\s+a\s+threaded\s+comment", lines[0], flags=re.I):
+            lines = lines[1:]
+    s = "\n".join(lines)
+    s = s.replace("https://go.microsoft.com/fwlink/?linkid=870924.", "")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+    return s
+
+def load_threaded_comments_map_from_bytes(xlsx_bytes: bytes) -> dict:
     """
-    Fail 셀 + 코멘트는 wb_comments(data_only=False)에서,
-    해당 열의 Model/GPU/Chipset/OS/Rank는 wb_values(data_only=True)에서 읽는다.
+    .xlsx 바이트에서 스레드 댓글을 파싱해 {(sheet_name, cell_ref): "text"} 사전으로 반환.
+    여러 댓글이 한 셀에 붙은 경우 ' | '로 이어 붙임.
     """
+    mapping = {}  # key: (sheet_name, ref), value: list[str]
+    try:
+        with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as zf:
+            # 1) workbook -> (rId -> target), (sheet name -> rId)
+            rels_map = {}
+            try:
+                rels_xml = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+                rn = {"r": "http://schemas.openxmlformats.org/package/2006/relationships"}
+                for rel in rels_xml.findall("Relationship", rn):
+                    rels_map[rel.get("Id")] = rel.get("Target")
+            except Exception:
+                pass
+
+            sheet_to_target = {}
+            try:
+                wb_xml = ET.fromstring(zf.read("xl/workbook.xml"))
+                ns = {"ns": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+                      "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
+                for s in wb_xml.find("ns:sheets", ns).findall("ns:sheet", ns):
+                    rid = s.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+                    name = s.get("name")
+                    target = rels_map.get(rid, "")
+                    if target.startswith("/"): target = target[1:]
+                    sheet_to_target[name] = target  # e.g. worksheets/sheet1.xml
+            except Exception:
+                pass
+
+            # 2) 각 시트 rels에서 threadedComments 링크 찾기 -> XML 파싱
+            for sheet_name, sheet_target in sheet_to_target.items():
+                if not sheet_target: continue
+                base = sheet_target.rsplit("/", 1)[0] if "/" in sheet_target else ""
+                rels_path = f"xl/{base}/_rels/{sheet_target.split('/')[-1]}.rels" if base else f"xl/_rels/{sheet_target}.rels"
+                if rels_path not in zf.namelist():  # 시트에 rels가 없으면 continue
+                    continue
+
+                rels_xml = ET.fromstring(zf.read(rels_path))
+                rn = {"r": "http://schemas.openxmlformats.org/package/2006/relationships"}
+                for rel in rels_xml.findall("Relationship", rn):
+                    typ = rel.get("Type") or ""
+                    if typ.endswith("/2018/threadedcomments"):
+                        target = rel.get("Target", "")
+                        if target.startswith("/"): target = target[1:]
+                        tc_path = f"xl/{target}" if not target.startswith("xl/") else target
+                        if tc_path not in zf.namelist():  # 방어
+                            continue
+                        try:
+                            tc_xml = ET.fromstring(zf.read(tc_path))
+                            # threadedComment 노드마다 ref="A1" 등 셀 주소가 있음
+                            for tcm in tc_xml.iter():
+                                if tcm.tag.endswith("threadedComment"):
+                                    cell_ref = tcm.get("ref")
+                                    if not cell_ref:
+                                        continue
+                                    texts = []
+                                    # 텍스트 노드 수집
+                                    for node in tcm.iter():
+                                        if node.text and node.tag.endswith(("t", "text")):
+                                            texts.append(str(node.text))
+                                    txt = " ".join([x.strip() for x in texts if x and x.strip()])
+                                    if txt:
+                                        mapping.setdefault((sheet_name, cell_ref), []).append(txt)
+                        except Exception:
+                            continue
+
+        # 3) 리스트 -> 문자열 합치기 + 정리
+        mapping = {k: _sanitize_excel_comment(" | ".join(v)) for k, v in mapping.items()}
+    except Exception:
+        mapping = {}
+    return mapping
+
+# ==============================
+# Fail + 코멘트 추출 (라벨행→Fail열)
+# ==============================
+def extract_comments_as_dataframe_dual(wb_comments, wb_values, target_sheet_names, threaded_map: dict = None):
+    """
+    Fail 셀과 코멘트를 찾고, 해당 Fail "열(column)"에서
+    Model/GPU/Chipset/RAM/OS/Rank 값을 라벨행 기준으로 수직 추출.
+    병합셀도 보정하여 정확도 확보.
+    threaded_map: {(sheet_name, "A1"): "threaded text"} 보강에 사용.
+    """
+    if threaded_map is None:
+        threaded_map = {}
+
     extracted = []
     for sheet_name in target_sheet_names:
         if sheet_name not in wb_comments.sheetnames or sheet_name not in wb_values.sheetnames:
             continue
-        ws_c = wb_comments[sheet_name]  # 코멘트/Fail 탐지
-        ws_v = wb_values[sheet_name]    # 수식 평가 값
+        ws_c = wb_comments[sheet_name]
+        ws_v = wb_values[sheet_name]
 
         header_rows = {
             "Model":   find_row_by_labels(ws_c, ["Model","Device","제품명","제품","모델명","모델","단말","단말명","기종"]),
@@ -137,21 +236,29 @@ def extract_comments_as_dataframe_dual(wb_comments, wb_values, target_sheet_name
                 v = str(int(v)) if isinstance(v, float) and v.is_integer() else str(v)
             if isinstance(v, str) and v.startswith("="):
                 return ""
-            return (v or "").strip()
+            return (str(v) if v is not None else "").strip()
 
         for row in ws_c.iter_rows():
             for cell in row:
                 val = cell.value
-                if isinstance(val, str) and val.strip().lower() == "fail" and cell.comment:
+                if isinstance(val, str) and re.fullmatch(r"\s*fail\s*", val, flags=re.I):
                     r, c = cell.row, cell.column
 
-                    # 값은 data_only=True 워크북에서 읽는다
-                    device_info = { key: _get_val(rr, c) for key, rr in header_rows.items() }
+                    # 1) openpyxl Notes(구형 메모)
+                    raw_comment = (getattr(cell, "comment", None).text if getattr(cell, "comment", None) else "")
+                    ctext = _sanitize_excel_comment(raw_comment)
 
-                    # 스레드 댓글 안내문 제거
-                    ctext = (cell.comment.text or "").strip()
-                    if ctext.startswith("[스레드 댓글]"):
-                        ctext = ""
+                    # 2) threadedComments 보강
+                    if not ctext:
+                        key = (sheet_name, cell.coordinate)  # (시트명, "A1")
+                        if key in threaded_map:
+                            ctext = _sanitize_excel_comment(threaded_map[key])
+
+                    # 3) 여전히 없다면 스킵
+                    if not ctext:
+                        continue
+
+                    device_info = { key: _get_val(rr, c) for key, rr in header_rows.items() }
 
                     extracted.append({
                         "Sheet": ws_c.title,
@@ -337,9 +444,9 @@ def parse_llm_json(text: str) -> Dict[str, Any]:
     obj.setdefault("actions", [])
     return obj
 
-# ==============================
-# Summary 상세 블록 빌더
-# ==============================
+# ------------------------------
+# Summary 상세 블록
+# ------------------------------
 _DEVICE_PAT = re.compile(r"(Galaxy\s?[A-Z0-9\-]+|SM\-[A-Z0-9]+|iPhone\s?[A-Z0-9\-+ ]+|Pixel\s?\d+(?:\sPro)?|Redmi\s?[A-Z0-9\-]+|Xiaomi\s?[A-Z0-9\-]+|OPPO\s?[A-Z0-9\-]+|VIVO\s?[A-Z0-9\-]+)", re.I)
 
 def _pick_devices_from_evidence(evidence_list, fallback_models=None, topn=3):
