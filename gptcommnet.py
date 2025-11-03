@@ -82,40 +82,46 @@ def normalize_model_name_strict(s):
 # =========================
 # 헤더 탐지: 행 기반 디바이스/OS 추출용
 # =========================
-def _detect_header_map(ws, max_scan_rows=12):
+def _detect_header_map(ws, max_scan_rows=40):
     """
     워크시트 상단에서 헤더 행을 찾고, 디바이스/OS 관련 칼럼 인덱스를 매핑.
     반환: {"header_row": r, "device_col": c or None, "os_col": c or None}
     """
-    header_row = None
-    device_col = None
-    os_col = None
-
-    dev_pats = [r"^(device|model|모델|모델명|제품|제품명)$"]
-    os_pats  = [r"^(os|os\s*version|android|ios|펌웨어|소프트웨어버전)$"]
-
     def _norm_cell(v):
-        s = unicodedata.normalize("NFKC", str(v or "")).strip().lower()
-        s = re.sub(r"[\s\-\_/()\[\]{}:+·∙•]", "", s)
+        s = unicodedata.normalize("NFKC", str(v or "")).lower().strip()
+        s = re.sub(r"[\s\-\_/()\[\]{}:+·∙•]", "", s)  # 공백/구분자 제거
         return s
 
-    for r in range(1, max_scan_rows + 1):
-        values = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)]
+    # 폭넓은 패턴(정확일치 + 부분일치)
+    dev_exact = re.compile(r"^(device|model|모델|모델명|제품|제품명|단말|단말기명)$")
+    dev_contains = re.compile(r"(device|model|모델|모델명|제품|제품명|단말)")
+    os_exact  = re.compile(r"^(os|osversion|android|ios|펌웨어|소프트웨어버전)$")
+    os_contains = re.compile(r"(os|android|ios|펌웨어|소프트웨어)")
+
+    header_row, device_col, os_col = None, None, None
+    max_c = ws.max_column
+
+    for r in range(1, min(max_scan_rows, ws.max_row) + 1):
+        values = [ws.cell(row=r, column=c).value for c in range(1, max_c + 1)]
         normed = [_norm_cell(v) for v in values]
         if sum(1 for v in normed if v) < 2:
             continue
 
         d_idx, o_idx = None, None
         for ci, v in enumerate(normed, start=1):
-            if v:
-                if any(re.search(p, v) for p in dev_pats) and d_idx is None:
+            if not v:
+                continue
+            # 디바이스 컬럼 후보
+            if dev_exact.match(v) or dev_contains.search(v) or v in ("devicemodel", "devicemodelname", "devicename"):
+                if d_idx is None:
                     d_idx = ci
-                if any(re.search(p, v) for p in os_pats) and o_idx is None:
+            # OS 컬럼 후보
+            if os_exact.match(v) or os_contains.search(v):
+                if o_idx is None:
                     o_idx = ci
+
         if d_idx or o_idx:
-            header_row = r
-            device_col = d_idx
-            os_col = o_idx
+            header_row, device_col, os_col = r, d_idx, o_idx
             break
 
     return {"header_row": header_row, "device_col": device_col, "os_col": os_col}
@@ -590,3 +596,4 @@ if uploaded_file:
                 st.download_button("📊 Excel 리포트 다운로드", f.read(), file_name=output)
         except Exception as e:
             st.error(f"리포트 생성 오류: {e}")
+
