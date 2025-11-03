@@ -258,8 +258,7 @@ def build_user_prompt(
         "변동: {이전 릴리스 대비 변화}\n"
         "근거: {대표 실패 로그/링크}\n\n"
         + guideline + "\n\n=== 데이터(JSON) ===\n"
-        # 공백 제거로 토큰 절감
-        + json.dumps(payload, ensure_ascii=False, separators=(",",":"))
+        + json.dumps(payload, ensure_ascii=False, separators=(",",":"))  # 공백 제거로 토큰 절감
     )
 
 def parse_llm_json(text: str) -> Dict[str, Any]:
