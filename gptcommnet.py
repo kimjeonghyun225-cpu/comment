@@ -246,8 +246,6 @@ if uploaded_file:
                 except Exception as e:
                     st.error(f"스펙 병합 중 오류: {e}")
 
-        
-
         # 6) 자가진단
         with step_status("모듈 자가진단"):
             diag = self_check(df_final)
@@ -392,34 +390,18 @@ if uploaded_file:
                 return sum(len(enc.encode(m.get("content",""))) for m in msgs)
             except Exception:
                 return sum(_rough_token_count(m.get("content","")) for m in msgs)
-       def fit_prompt(build_user, base_kwargs,
-               target_input_tokens: int = 12000,
-               reserve_output: int = 1500):
-    """
-    입력 토큰을 target_input_tokens 이하로 자동 축소.
-    모델 한도보다 'TPM 안전구간'을 우선 고려.
-    """
-    try:
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")
-        def _tok(s: str) -> int: return len(enc.encode(s or ""))
-    except Exception:
-        def _tok(s: str) -> int: return max(1, int(len(s or "") / 2.5))
-
-    # 표본 줄이는 단계
-    row_caps = [250, 200, 160, 120, 80, 60, 40, 30, 20, 12]
-    last = None
-    for cap in row_caps:
-        kwargs = dict(base_kwargs)
-        kwargs["sample_issues"] = base_kwargs["sample_issues"].head(cap)
-        sp = build_system_prompt()
-        up = build_user(**kwargs)
-        used = _tok(sp) + _tok(up)
-        last = (sp, up, {"prompt_tokens_est": used, "max_rows": cap})
-        if used + reserve_output <= target_input_tokens:
-            return last
-    return last  # 최종 실패 시 가장 작은 버전
-
+        def fit_prompt(build_user, base_kwargs, model_budget=120000, reserve_output=6000):
+            max_rows_list = [800, 600, 400, 300, 200, 100]
+            df = base_kwargs["sample_issues"]
+            for mr in max_rows_list:
+                kwargs = dict(base_kwargs)
+                kwargs["sample_issues"] = df.head(mr)
+                sp = build_system_prompt()
+                up = build_user(**kwargs)
+                used = estimate_tokens([{"content": sp},{"content": up}])
+                if used + reserve_output < model_budget:
+                    return sp, up, {"prompt_tokens_est": used, "max_rows": mr}
+            return sp, up, {"warn": "budget_exceeded"}
 
         base_kwargs = {
             "project": "UNKNOWN_PROJECT",
