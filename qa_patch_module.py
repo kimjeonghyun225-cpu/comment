@@ -418,6 +418,7 @@ def build_user_prompt(
         "   - 대표 증상은 sample_issues와 metrics.by_issue_tag(전역 태그 빈도)를 근거로 서술\n"
         "   - 군집 관련 이슈가 미미하면 생략 가능\n"
         "   - 선택적으로 JSON 키 cluster_gpu_summary[], cluster_chipset_summary[]에 문장 배열로 포함\n"
+        "8) GPU/Chipset 군집 요약을 Summary에도 반드시 반영하라\n"
         "3) 공통 Feature 군집(펀치홀/노치/회전/입력지연/렌더 아티팩트 등) 요약: metrics.clusters_feature_detailed 활용\n"
         "4) 핵심 이슈(증상/재현/근거/영향/우선순위/원인·권고)\n"
         "5) 디바이스 리스크(조합·원인 추정)\n"
