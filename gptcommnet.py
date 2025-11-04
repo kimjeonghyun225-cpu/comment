@@ -137,25 +137,43 @@ with step_status("비고/Notes 병합"):
         df_issue = enrich_with_column_comments(xls, _sheet, df_issue)
     diag_dump("비고 병합 결과", df_issue.head(12))
 
-# 5) 스펙 병합 (모델명 정규화 후 Join)
+# 5) 스펙 병합 (모델명 정규화 후 Join—헤더 자동탐지 + 부분일치 백업)
 df_final = df_issue.copy()
 match_rate = 0.0
+
 if spec_sheets_selected:
     with step_status("스펙 병합"):
-        def _stdcols(df: pd.DataFrame) -> pd.DataFrame:
+        # ---------- 공통 유틸 ----------
+        def _norm_hdr(s: str) -> str:
+            s = unicodedata.normalize("NFKC", str(s))
+            s = re.sub(r"[\s\-\_/()\[\]{}:+·∙•]", "", s).lower()
+            return s
+
+        def find_header_row_for_spec(xls, sheet, max_scan_rows=20):
+            """스펙 시트에서 헤더 행(모델 관련 키워드가 포함된 행)을 위에서부터 탐색"""
+            probe = pd.read_excel(xls, sheet_name=sheet, header=None, engine="openpyxl")
+            header_keywords = [r"^model$", r"^device$", r"^제품명$", r"^모델$", r"^모델명$", r"^기종$", r"^단말$", r"^단말명$"]
+            for r in range(min(max_scan_rows, len(probe))):
+                rowvals = probe.iloc[r].astype(str).fillna("")
+                normvals = [_norm_hdr(v) for v in rowvals]
+                if any(any(re.search(p, v) for p in header_keywords) for v in normvals):
+                    return r
+            return 0  # 못 찾으면 0행 가정
+
+        def standardize_spec_columns(df: pd.DataFrame) -> pd.DataFrame:
+            """스펙 시트 컬럼 동의어를 표준 컬럼으로 통일"""
             orig = list(df.columns)
-            norm = [unicodedata.normalize("NFKC", str(c)) for c in orig]
-            norm = [re.sub(r"[\s\-\_/()\[\]{}:+·∙•]", "", s).lower() for s in norm]
+            norm = [_norm_hdr(c) for c in orig]
+            col_map = {}
             synonyms = {
                 r"^(model|device|제품명|제품|모델명|모델|단말|단말명|기종)$": "Model",
                 r"^(maker|manufacturer|brand|oem|제조사|벤더)$": "제조사",
-                r"^(gpu|그래픽|그래픽칩|그래픽스|그래픽프로세서|gpu모델|gpu명)$": "GPU",
+                r"^(gpu|gpu명|gpumodel|graphics|그래픽|그래픽칩|그래픽스|그래픽프로세서)$": "GPU",
                 r"^(chipset|soc|ap|cpu|processor)$": "Chipset",
                 r"^(ram|메모리)$": "RAM",
                 r"^(os|osversion|android|ios|펌웨어|소프트웨어버전|운영체제|os버전)$": "OS",
                 r"^(rank|rating|ratinggrade|등급)$": "Rank",
             }
-            col_map = {}
             for n, o in zip(norm, orig):
                 mapped = None
                 for pat, std in synonyms.items():
@@ -164,46 +182,92 @@ if spec_sheets_selected:
                 col_map[o] = mapped or o
             return df.rename(columns=col_map)
 
+        # ---------- 스펙 시트 적재 ----------
         frames = []
         for sname in spec_sheets_selected:
             try:
-                dfp = pd.read_excel(xls, sheet_name=sname, engine="openpyxl")
+                hdr = find_header_row_for_spec(xls, sname)
+                dfp = pd.read_excel(xls, sheet_name=sname, header=hdr, engine="openpyxl")
             except Exception:
                 continue
-            dfp = _stdcols(dfp)
+            dfp = standardize_spec_columns(dfp)
+
+            # 필수: Model 열
             model_col = "Model" if "Model" in dfp.columns else None
             if not model_col:
                 for c in dfp.columns:
-                    n = re.sub(r"[\s\-\_/()\[\]{}:+·∙•]", "", unicodedata.normalize("NFKC", str(c))).lower()
-                    if re.search(r"^(model|device|제품명|제품|모델명|모델|단말|단말명|기종)$", n): model_col = c; break
+                    if re.search(r"^(model|device|제품명|제품|모델명|모델|단말|단말명|기종)$", _norm_hdr(c)):
+                        model_col = c; break
             if not model_col:
                 continue
+
+            # 정규화 키 생성
             dfp["model_norm"] = dfp[model_col].apply(normalize_model_name_strict)
-            keep = ["model_norm"] + [c for c in ["GPU","제조사","Chipset","RAM","OS","Rank","Model","CPU"] if c in dfp.columns]
+
+            # 보조 키(색상·용량 제거 전 원문도 보관)
+            dfp["model_raw"] = dfp[model_col].astype(str)
+
+            # 유지 컬럼
+            keep = ["model_norm", "model_raw"] + [c for c in ["GPU","제조사","Chipset","RAM","OS","Rank","Model","CPU"] if c in dfp.columns]
             frames.append(dfp[keep])
 
-        if frames:
+        if not frames:
+            st.warning("선택한 스펙 시트에서 유효한 헤더/모델 열을 찾지 못했습니다. (헤더 위치/열 이름 확인)")
+        else:
             df_spec_all = pd.concat(frames, ignore_index=True).drop_duplicates("model_norm", keep="first")
-            df_final["model_norm"] = df_final["Device(Model)"].apply(normalize_model_name_strict)
-            df_final = pd.merge(df_final, df_spec_all, on="model_norm", how="left")
 
+            # ---------- 이슈쪽 모델 정규화 ----------
+            df_final["model_norm"] = df_final["Device(Model)"].apply(normalize_model_name_strict)
+
+            # 1차: model_norm으로 정석 병합
+            df_final = pd.merge(df_final, df_spec_all, on="model_norm", how="left", suffixes=("","_spec"))
+
+            # Chipset 보정
             if "Chipset" not in df_final.columns and "CPU" in df_final.columns:
                 df_final["Chipset"] = df_final["CPU"]
 
+            # 접미사 정리
             for col in ["GPU","제조사","Chipset","RAM","OS","Rank","Model"]:
-                cx, cy = f"{col}_x", f"{col}_y"
+                cx, cy = f"{col}", f"{col}_spec"
                 if cx in df_final.columns and cy in df_final.columns:
-                    df_final[col] = df_final[cx].where(df_final[cx].notna(), df_final[cy])
-                    df_final.drop(columns=[cx, cy], inplace=True)
-                elif cx in df_final.columns:
-                    df_final.rename(columns={cx: col}, inplace=True)
+                    df_final[col] = df_final[cx].where(df_final[cx].notna() & (df_final[cx]!=""), df_final[cy])
+                    df_final.drop(columns=[cy], inplace=True, errors="ignore")
                 elif cy in df_final.columns:
                     df_final.rename(columns={cy: col}, inplace=True)
 
+            # ---------- 2차: 부분일치(contains) 백업 매칭 ----------
+            # 정석 병합 후에도 GPU가 비었고 Device(Model)가 남아있으면, 스펙의 model_raw에 부분 포함되는지 검사
             if "GPU" in df_final.columns:
-                matched = int(df_final["GPU"].notna().sum())
-                match_rate = round(matched / len(df_final) * 100, 1)
-                st.success(f"스펙 매칭 결과: {matched} / {len(df_final)} 건 ({match_rate}%)")
+                mask_need = (df_final["GPU"].isna() | (df_final["GPU"].astype(str).str.strip()=="")) & (df_final["Device(Model)"].astype(str).str.len()>0)
+                if mask_need.any():
+                    spec_index = df_spec_all[["model_raw","GPU","Chipset","OS","Rank"]].dropna(subset=["model_raw"]).reset_index(drop=True)
+                    # 간단 contains 매칭 (여러 개 매칭되면 첫 번째만 사용)
+                    # 속도 위해 상위 5천행 정도만 비교(보통 스펙 테이블이 크지 않음)
+                    for idx in df_final[mask_need].index.tolist():
+                        dev = str(df_final.at[idx, "Device(Model)"])
+                        dev_norm = normalize_model_name_strict(dev)
+                        # 1) 완전 포함
+                        hit = spec_index[spec_index["model_raw"].astype(str).str.replace(r"\s+","",regex=True).str.lower().str.contains(dev_norm, regex=False)]
+                        # 2) 역방향 포함 (스펙이 더 짧을 수도)
+                        if hit.empty and dev_norm:
+                            hit = spec_index[spec_index["model_raw"].astype(str).str.lower().apply(lambda x: dev_norm in re.sub(r"\s+","",x))]
+                        if not hit.empty:
+                            h0 = hit.iloc[0]
+                            for col in ["GPU","Chipset","OS","Rank"]:
+                                if (col in df_final.columns) and ((pd.isna(df_final.at[idx, col])) or (str(df_final.at[idx, col]).strip()=="")):
+                                    df_final.at[idx, col] = h0.get(col, "")
+            
+            # ---------- 진단 ----------
+            # 매칭률
+            if "GPU" in df_final.columns:
+                matched = int(df_final["GPU"].fillna("").astype(str).str.strip().ne("").sum())
+                match_rate = round(matched / max(1,len(df_final)) * 100, 1)
+                st.success(f"스펙 매칭 결과: GPU 채움 {matched} / {len(df_final)} 건 ({match_rate}%)")
+
+            # 매칭 실패 샘플 출력
+            diag_dump("스펙 병합 미매칭 샘플(상위 20)", 
+                      df_final[df_final["GPU"].fillna("").astype(str).str.strip()==""][["Device(Model)","GPU","Chipset","OS","Rank"]].head(20))
+
 
 # 6) 자가진단
 with step_status("모듈 자가진단"):
@@ -427,3 +491,4 @@ try:
         st.download_button("📊 Excel 리포트 다운로드", f.read(), file_name=output)
 except Exception as e:
     st.error(f"리포트 생성 오류: {e}")
+
