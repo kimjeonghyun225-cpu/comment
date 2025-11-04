@@ -472,19 +472,26 @@ def _pick_devices_from_evidence(evidence_list, fallback_models=None, topn=3):
                 break
     return ", ".join(devices[:topn]) if devices else ""
 
-def build_summary_block(issues: List[Dict[str, Any]], topn: int = 100, metrics: Optional[Dict[str, Any]] = None) -> str:
-    lines = []
+def build_summary_block(
+    issues: List[Dict[str, Any]],
+    topn: int = 100,
+    metrics: Optional[Dict[str, Any]] = None,
+    llm_cluster: Optional[Dict[str, Any]] = None,
+) -> str:
+    lines: List[str] = []
+
+    # [A] 개별 이슈 요약 (기존 동작 유지)
     for i, iss in enumerate(issues or [], start=1):
         if i > topn: break
         symp   = (iss.get("symptom") or "").strip()
         impact = (iss.get("impact") or "").strip()
         cause  = (iss.get("cause") or "").strip()
         rec    = (iss.get("recommendation") or "").strip()
-        devices = _pick_devices_from_evidence(
-            iss.get("evidence", []),
-            fallback_models=iss.get("repr_models") or [],
-            topn=3
-        )
+
+        ev_list = iss.get("evidence", []) or []
+        repr_models = iss.get("repr_models") or []
+        devices = _pick_devices_from_evidence(ev_list, fallback_models=repr_models, topn=3) if (ev_list or repr_models) else ""
+
         block = "\n".join([
             f"* 현상: {symp or '(미기재)'}",
             f"* 발생 기기: {devices}",
@@ -492,8 +499,104 @@ def build_summary_block(issues: List[Dict[str, Any]], topn: int = 100, metrics: 
             f"* 원인 추정: {cause or '(미기재)'}",
             f"* 권고: {rec or '(미기재)'}",
         ])
-        lines.append(block.strip()); lines.append("---")
+        lines.append(block.strip())
+        lines.append("---")
 
+    # ===== [B] GPU/Chipset 군집 요약 (LLM 우선, 없으면 로컬 백필) =====
+    def _append_section(title: str, bullets: List[str]):
+        if not bullets: return
+        lines.append(title)
+        for b in bullets:
+            b = str(b).strip()
+            if b:
+                lines.append(f"- {b}")
+        lines.append("---")
+
+    # LLM이 제공했으면 우선 사용
+    llm_gpu = []
+    llm_chip = []
+    if isinstance(llm_cluster, dict):
+        v1 = llm_cluster.get("cluster_gpu_summary")
+        v2 = llm_cluster.get("cluster_chipset_summary")
+        if isinstance(v1, list): llm_gpu = [str(x).strip() for x in v1 if str(x).strip()]
+        if isinstance(v2, list): llm_chip = [str(x).strip() for x in v2 if str(x).strip()]
+
+    # 로컬 백필 준비
+    def _topn_list(rows, n=3):
+        arr = []
+        for r in rows or []:
+            if not isinstance(r, dict): continue
+            key = str(r.get("GPU") or r.get("Chipset") or "").strip()
+            cnt = int(r.get("count") or 0)
+            if key:
+                arr.append((key, cnt))
+        arr.sort(key=lambda x: x[1], reverse=True)
+        return arr[:n]
+
+    def _should_show_cluster(by_rows, total_issues, by_issue_tag):
+        # 군집 요약이 '필요한' 경우만 표시: 하드웨어 연관 태그 or 비중 임계치
+        if not total_issues or total_issues <= 0: return False
+        hw_tags = {
+            "fps","thermal","render_artifact","black_screen","white_screen",
+            "crash","input_lag","ui_scaling","resolution","aspect_ratio",
+            "audio","camera","network"
+        }
+        tag_hit = False
+        try:
+            for row in (by_issue_tag or []):
+                val = str(row.get("value","")).strip().lower()
+                cnt = int(row.get("count") or 0)
+                if cnt >= 2 and val in hw_tags:
+                    tag_hit = True; break
+        except Exception:
+            pass
+
+        dominant = False
+        try:
+            top = _topn_list(by_rows, n=1)
+            if top:
+                _, top_cnt = top[0]
+                if top_cnt >= 3 or (top_cnt / max(1, total_issues)) >= 0.25:
+                    dominant = True
+        except Exception:
+            pass
+
+        return tag_hit or dominant
+
+    total_issues = int((metrics or {}).get("total_fail_issues") or 0)
+    by_issue_tag = (metrics or {}).get("by_issue_tag") or []
+    clusters = (metrics or {}).get("clusters") or {}
+    by_gpu_rows = clusters.get("by_gpu") or []
+    by_chip_rows = clusters.get("by_chipset") or []
+
+    gpu_bullets, chip_bullets = [], []
+
+    # GPU
+    if llm_gpu:
+        gpu_bullets = llm_gpu
+    else:
+        if _should_show_cluster(by_gpu_rows, total_issues, by_issue_tag):
+            tops = _topn_list(by_gpu_rows, n=3)
+            top_tags = sorted(by_issue_tag, key=lambda x: int(x.get("count",0)), reverse=True)[:3]
+            tag_phrase = "/".join([str(t.get("value","")) for t in top_tags if str(t.get("value","")).strip()])
+            for name, cnt in tops:
+                gpu_bullets.append(f"{name}: {cnt}건 (대표 증상: {tag_phrase or '디스플레이/성능/안정성'})")
+
+    # Chipset
+    if llm_chip:
+        chip_bullets = llm_chip
+    else:
+        if _should_show_cluster(by_chip_rows, total_issues, by_issue_tag):
+            tops = _topn_list(by_chip_rows, n=3)
+            top_tags = sorted(by_issue_tag, key=lambda x: int(x.get("count",0)), reverse=True)[:3]
+            tag_phrase = "/".join([str(t.get("value","")) for t in top_tags if str(t.get("value","")).strip()])
+            for name, cnt in tops:
+                chip_bullets.append(f"{name}: {cnt}건 (대표 증상: {tag_phrase or '디스플레이/성능/안정성'})")
+
+    _append_section("GPU 군집 요약", gpu_bullets)
+    _append_section("Chipset 군집 요약", chip_bullets)
+
+    # ===== [C] Feature 군집 요약 (기존 유지) =====
     if isinstance(metrics, dict):
         fcd = metrics.get("clusters_feature_detailed") or []
         for c in fcd:
@@ -531,6 +634,7 @@ def build_summary_block(issues: List[Dict[str, Any]], topn: int = 100, metrics: 
     while lines and lines[-1] == "---":
         lines.pop()
     return "\n\n".join(lines).strip()
+
 
 # ==============================
 # Excel 리포트
