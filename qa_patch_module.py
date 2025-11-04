@@ -391,7 +391,6 @@ def build_system_prompt() -> str:
         "metrics.log_hypotheses 존재 시 cause/evidence에 우선 반영.\n"
         "출력은 반드시 JSON이며 아래 스키마를 엄격 준수.\n" + JSON_SCHEMA_DOC
     )
-
 def build_user_prompt(
     project: str,
     version: str,
@@ -411,14 +410,20 @@ def build_user_prompt(
         "sample_issues": sample
     }
     guideline = (
-        "[역할] QA 리드\n"
+        "[역할] 모바일 앱/게임 QA 리드\n"
         "[지시]\n"
-        "1) 한 줄 총평(≤150자)\n"
-        "2) 핵심 이슈(증상/재현/근거/영향/우선순위)\n"
-        "3) 디바이스 리스크(조합·원인 추정)\n"
-        "4) 액션플랜(담당/기한/검증기준)\n"
-        "5) 릴리스 권고(Go/No-Go/Conditional+조건)\n"
-        "※ clusters_feature_detailed / by_issue_tag 를 활용해 GPU/CPU 외 공통 이슈도 요약."
+        "1) 한 줄 총평(≤300자)\n"
+        "2) GPU/Chipset 군집 요약: metrics.clusters.by_gpu / by_chipset 상위 Top 3를 활용하여\n"
+        "   - 각 군집별 발생 건수와 특징(대표 증상)·권고를 1~2문장씩 요약\n"
+        "   - 대표 증상은 sample_issues와 metrics.by_issue_tag(전역 태그 빈도)를 근거로 서술\n"
+        "   - 군집 관련 이슈가 미미하면 생략 가능\n"
+        "   - 선택적으로 JSON 키 cluster_gpu_summary[], cluster_chipset_summary[]에 문장 배열로 포함\n"
+        "3) 공통 Feature 군집(펀치홀/노치/회전/입력지연/렌더 아티팩트 등) 요약: metrics.clusters_feature_detailed 활용\n"
+        "4) 핵심 이슈(증상/재현/근거/영향/우선순위/원인·권고)\n"
+        "5) 디바이스 리스크(조합·원인 추정)\n"
+        "6) 액션플랜(담당/기한/검증기준)\n"
+        "7) 릴리스 권고(Go/No-Go/Conditional+조건)\n"
+        "[원칙] 과장 금지, 데이터 근거 기반, 중복 지양. 출력은 JSON만."
     )
     return (
         "다음 입력을 바탕으로 [지시]를 충실히 이행하고, 오직 JSON만 출력하십시오.\n"
@@ -426,7 +431,6 @@ def build_user_prompt(
         + guideline + "\n\n=== 데이터(JSON) ===\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",",":"))
     )
-
 def parse_llm_json(text: str) -> Dict[str, Any]:
     t = text.strip().strip("`").strip()
     try:
