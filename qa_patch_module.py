@@ -413,7 +413,7 @@ def build_user_prompt(
         "[역할] 모바일 앱/게임 QA 리드\n"
         "[지시]\n"
         "1) 한 줄 총평(≤300자)\n"
-        "2) GPU/Chipset 군집 요약: metrics.clusters.by_gpu / by_chipset 상위 Top 3를 활용하여\n"
+        "2) GPU/Chipset 군집 요약: metrics.clusters.by_gpu / by_chipset 과 공통 이슈내용을 활용하여\n"
         "   - 각 군집별 발생 건수와 특징(대표 증상)·권고를 1~2문장씩 요약\n"
         "   - 대표 증상은 sample_issues와 metrics.by_issue_tag(전역 태그 빈도)를 근거로 서술\n"
         "   - 군집 관련 이슈가 미미하면 생략 가능\n"
