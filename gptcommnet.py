@@ -237,26 +237,64 @@ if spec_sheets_selected:
 
             # ---------- 2차: 부분일치(contains) 백업 매칭 ----------
             # 정석 병합 후에도 GPU가 비었고 Device(Model)가 남아있으면, 스펙의 model_raw에 부분 포함되는지 검사
-            if "GPU" in df_final.columns:
-                mask_need = (df_final["GPU"].isna() | (df_final["GPU"].astype(str).str.strip()=="")) & (df_final["Device(Model)"].astype(str).str.len()>0)
-                if mask_need.any():
-                    spec_index = df_spec_all[["model_raw","GPU","Chipset","OS","Rank"]].dropna(subset=["model_raw"]).reset_index(drop=True)
-                    # 간단 contains 매칭 (여러 개 매칭되면 첫 번째만 사용)
-                    # 속도 위해 상위 5천행 정도만 비교(보통 스펙 테이블이 크지 않음)
-                    for idx in df_final[mask_need].index.tolist():
-                        dev = str(df_final.at[idx, "Device(Model)"])
-                        dev_norm = normalize_model_name_strict(dev)
-                        # 1) 완전 포함
-                        hit = spec_index[spec_index["model_raw"].astype(str).str.replace(r"\s+","",regex=True).str.lower().str.contains(dev_norm, regex=False)]
-                        # 2) 역방향 포함 (스펙이 더 짧을 수도)
-                        if hit.empty and dev_norm:
-                            hit = spec_index[spec_index["model_raw"].astype(str).str.lower().apply(lambda x: dev_norm in re.sub(r"\s+","",x))]
-                        if not hit.empty:
-                            h0 = hit.iloc[0]
-                            for col in ["GPU","Chipset","OS","Rank"]:
-                                if (col in df_final.columns) and ((pd.isna(df_final.at[idx, col])) or (str(df_final.at[idx, col]).strip()=="")):
-                                    df_final.at[idx, col] = h0.get(col, "")
-            
+# ---------- 2차: 부분일치(contains) 백업 매칭 ----------
+
+if "GPU" in df_final.columns:
+    mask_need = (
+        df_final["GPU"].isna()
+        | (df_final["GPU"].astype(str).str.strip() == "")
+    ) & (df_final["Device(Model)"].astype(str).str.len() > 0)
+
+    if mask_need.any():
+        # ✅ df_spec_all에 실제로 존재하는 컬럼만 사용
+        base_cols = ["model_raw", "GPU", "Chipset", "OS", "Rank"]
+        existing_cols = [c for c in base_cols if c in df_spec_all.columns]
+
+        if "model_raw" not in existing_cols:
+            # model_raw 자체가 없으면 부분 매칭을 할 수 없으므로 스킵
+            st.warning("⚠ 스펙 시트에 model_raw(모델명 원문) 컬럼이 없어 부분 매칭을 생략합니다.")
+        else:
+            spec_index = (
+                df_spec_all[existing_cols]
+                .dropna(subset=["model_raw"])
+                .reset_index(drop=True)
+            )
+
+            for idx in df_final[mask_need].index.tolist():
+                dev = str(df_final.at[idx, "Device(Model)"])
+                dev_norm = normalize_model_name_strict(dev)
+
+                hit = spec_index[
+                    spec_index["model_raw"]
+                    .astype(str)
+                    .str.replace(r"\s+", "", regex=True)
+                    .str.lower()
+                    .str.contains(dev_norm, regex=False)
+                ]
+
+                if hit.empty and dev_norm:
+                    hit = spec_index[
+                        spec_index["model_raw"]
+                        .astype(str)
+                        .str.lower()
+                        .apply(lambda x: dev_norm in re.sub(r"\s+", "", x))
+                    ]
+
+                if not hit.empty:
+                    h0 = hit.iloc[0]
+                    # ✅ spec_index에 실제로 있는 컬럼만 채우도록 방어
+                    for col in ["GPU", "Chipset", "OS", "Rank"]:
+                        if col not in spec_index.columns:
+                            continue
+                        if (
+                            col in df_final.columns
+                            and (
+                                pd.isna(df_final.at[idx, col])
+                                or str(df_final.at[idx, col]).strip() == ""
+                            )
+                        ):
+                            df_final.at[idx, col] = h0.get(col, "")
+
             # ---------- 진단 ----------
             # 매칭률
             if "GPU" in df_final.columns:
@@ -491,4 +529,5 @@ try:
         st.download_button("📊 Excel 리포트 다운로드", f.read(), file_name=output)
 except Exception as e:
     st.error(f"리포트 생성 오류: {e}")
+
 
