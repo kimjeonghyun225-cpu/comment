@@ -579,7 +579,7 @@ def write_excel_report(
             "Fail": fail_cnt,
             "Crash": crash_cnt,
         })
-    df_platform_stats = pd.DataFrame(platform_stats)
+    # df_platform_stats = pd.DataFrame(platform_stats)
 
     with pd.ExcelWriter(path, engine=engine) as wr:
         # 공통: 열 너비 자동 맞춤 + 자동 줄바꿈
